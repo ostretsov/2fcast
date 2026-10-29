@@ -1,0 +1,24 @@
+[package]
+name = "twofcast"
+version = "0.1.0"
+description = "Two-person LAN videocasting for Ubuntu"
+license = "MIT"
+edition = "2024"
+
+[[bin]]
+name = "2fcast"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+async-channel = "2.5.0"
+chrono = "0.4.45"
+gst = { version = "0.25.4", package = "gstreamer" }
+gst_app = { version = "0.25.2", package = "gstreamer-app" }
+gst_video = { version = "0.25.4", package = "gstreamer-video" }
+gtk = { version = "0.11.5", package = "gtk4", features = ["v4_6"] }
+twofcast-core = { version = "0.1.0", path = "../core" }
+x11rb = "0.14.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=2fcast
+Comment=Two faces, one shared screen, one recording - over the local network
+Exec=2fcast
+Icon=camera-video
+Terminal=false
+Categories=AudioVideo;Video;Recorder;Network;

@@ -1,0 +1,18 @@
+[package]
+name = "twofcast-core"
+version = "0.1.0"
+license = "MIT"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+cairo-rs = { version = "0.22.9", default-features = false, features = ["png"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+mdns-sd = "0.21.6"
+rand = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+toml = "1.1.8"
+
+[dev-dependencies]
+tempfile = "3.27.0"
