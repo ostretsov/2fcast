@@ -15,7 +15,7 @@ jobs:
     # The oldest supported Ubuntu: the bundle needs a glibc no newer than the user's.
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Tag matches the crate version
         if: startsWith(github.ref, 'refs/tags/')
@@ -24,7 +24,11 @@ jobs:
           [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "Tag $GITHUB_REF_NAME but crates/app/Cargo.toml says $version (make version V=...)"; exit 1; }
 
       - name: Build dependencies
-        run: sudo apt-get update -qq && scripts/install-build-deps.sh
+        # The runner image's libunwind-14-dev conflicts with libunwind-dev (needed by libgstreamer1.0-dev).
+        run: |
+          sudo apt-get remove -y libunwind-14-dev || true
+          sudo apt-get update -qq
+          scripts/install-build-deps.sh
 
       - uses: dtolnay/rust-toolchain@stable
         with:
