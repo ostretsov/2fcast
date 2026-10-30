@@ -1,0 +1,48 @@
+# Builds the self-contained .deb and attaches it to a GitHub release.
+# Release:  make version V=x.y.z && git commit -am "Release x.y.z" && git tag vx.y.z && git push --follow-tags
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: # manual run: builds and tests the .deb, keeps it as a workflow artifact only
+
+permissions:
+  contents: write
+
+jobs:
+  deb:
+    # The oldest supported Ubuntu: the bundle needs a glibc no newer than the user's.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/app/Cargo.toml | head -1)
+          [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "Tag $GITHUB_REF_NAME but crates/app/Cargo.toml says $version (make version V=...)"; exit 1; }
+
+      - name: Build dependencies
+        run: sudo apt-get update -qq && scripts/install-build-deps.sh
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - run: make lint
+      - run: make deb
+      - name: Install in clean Ubuntu containers and run --self-test
+        run: scripts/docker-test.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: target/2fcast_*_amd64.deb
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" target/2fcast_*_amd64.deb --title "2fcast ${GITHUB_REF_NAME#v}" --generate-notes
