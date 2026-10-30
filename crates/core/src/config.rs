@@ -18,10 +18,29 @@ pub struct Config {
     pub camera: String,
     /// "default", a PulseAudio source name (see `pactl list sources short`) or "test".
     pub microphone: String,
+    /// Which input channel carries the mic: "auto", "both", "left" or "right".
+    /// Interfaces like the Scarlett put input 1 on the left, input 2 on the right.
+    pub microphone_channel: String,
+    /// Silence the mic while you are not speaking (no room noise recorded).
+    pub noise_gate: bool,
+    /// Gate threshold in dBFS: louder opens it.  Raise it in a noisy room.
+    pub noise_gate_db: f64,
+    /// Removes rumble below this frequency (Hz) from the mic; 0 = off.
+    pub high_pass_hz: f64,
+    /// Evens out loud and quiet speech (and limits peaks).
+    pub compressor: bool,
+    /// How much quieter (dB) the partner is on my speakers while I speak;
+    /// 0 = off.  Recordings are not affected.
+    pub duck_partner_db: f64,
+    /// Also send/record the sound of the shared window (e.g. a video).
+    pub share_sound: bool,
     /// Where recordings are written.
     pub output_dir: PathBuf,
     /// TCP control port; UDP media uses the next few even ports.
     pub base_port: u16,
+    /// Find the partner automatically on the LAN (mDNS).  Turn off to connect
+    /// only via `peer_address` (or not at all, e.g. for tests).
+    pub discovery: bool,
     /// Optional "ip:port" of the other machine, for networks without multicast.
     pub peer_address: Option<String>,
     pub record_bitrate_kbps: u32,
@@ -40,8 +59,16 @@ impl Default for Config {
             name: capitalize(&user),
             camera: "auto".into(),
             microphone: "default".into(),
+            microphone_channel: "auto".into(),
+            noise_gate: true,
+            noise_gate_db: crate::gate::DEFAULT_THRESHOLD_DB,
+            high_pass_hz: crate::voice::DEFAULT_HIGH_PASS_HZ,
+            compressor: true,
+            duck_partner_db: crate::voice::DEFAULT_DUCK_DB,
+            share_sound: true,
             output_dir: home.join("Videos").join("2fcast"),
             base_port: 47100,
+            discovery: true,
             peer_address: None,
             record_bitrate_kbps: 6000,
             record_preset: "veryfast".into(),
@@ -152,6 +179,14 @@ mod tests {
         assert_eq!(c.name, "Ivan");
         assert_eq!(c.base_port, 47200);
         assert_eq!(c.camera, "auto");
+        assert_eq!(
+            (c.microphone_channel.as_str(), c.noise_gate, c.noise_gate_db),
+            ("auto", true, -45.0)
+        );
+        assert_eq!(
+            (c.high_pass_hz, c.compressor, c.duck_partner_db),
+            (80.0, true, 6.0)
+        );
         assert!(!c.id.is_empty(), "id generated and saved");
         assert!(
             std::fs::read_to_string(dir.path().join("config.toml"))

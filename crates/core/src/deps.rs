@@ -1,6 +1,6 @@
 //! Runtime dependency check: which Ubuntu packages provide what we need.
 
-/// (GStreamer element, Ubuntu package providing it).
+/// (GStreamer element, Ubuntu package providing it).  `a|b` means either.
 pub const ELEMENTS: &[(&str, &str)] = &[
     ("videoconvert", "gstreamer1.0-plugins-base"),
     ("videoscale", "gstreamer1.0-plugins-base"),
@@ -33,7 +33,8 @@ pub const ELEMENTS: &[(&str, &str)] = &[
     ("interaudiosink", "gstreamer1.0-plugins-bad"),
     ("h264parse", "gstreamer1.0-plugins-bad"),
     ("x264enc", "gstreamer1.0-plugins-ugly"),
-    ("avdec_h264", "gstreamer1.0-libav"),
+    // Either H.264 decoder will do.
+    ("avdec_h264|openh264dec", "gstreamer1.0-libav"),
 ];
 
 /// (program, Ubuntu package).
@@ -46,7 +47,7 @@ pub fn missing_packages(
 ) -> Vec<&'static str> {
     let mut pkgs: Vec<&str> = ELEMENTS
         .iter()
-        .filter(|(e, _)| !has_element(e))
+        .filter(|(e, _)| !e.split('|').any(&has_element))
         .map(|(_, p)| *p)
         .chain(
             PROGRAMS
@@ -60,13 +61,68 @@ pub fn missing_packages(
     pkgs
 }
 
-/// Command that installs `pkgs` with a graphical password prompt.
+/// Shell commands that install `pkgs`: refresh the package lists first (stale
+/// lists make dependencies look unavailable) and let apt repair a half-done
+/// earlier install (`--fix-broken`).
+pub fn install_script(pkgs: &[&str]) -> String {
+    format!(
+        "apt-get update && apt-get install -y --fix-broken {}",
+        pkgs.join(" ")
+    )
+}
+
+/// Runs [`install_script`] as root with a graphical password prompt.
 pub fn install_command(pkgs: &[&str]) -> Vec<String> {
-    ["pkexec", "apt-get", "install", "-y"]
-        .iter()
-        .map(|s| s.to_string())
-        .chain(pkgs.iter().map(|s| s.to_string()))
-        .collect()
+    vec![
+        "pkexec".into(),
+        "sh".into(),
+        "-c".into(),
+        install_script(pkgs),
+    ]
+}
+
+/// The same, to type into a terminal.
+pub fn terminal_command(pkgs: &[&str]) -> String {
+    format!(
+        "sudo apt update && sudo apt install --fix-broken {}",
+        pkgs.join(" ")
+    )
+}
+
+/// Explains a failed `apt-get` run in plain words, with the commands to fix it.
+pub fn explain_apt_failure(output: &str) -> String {
+    let mut help = vec![];
+    // A dependency apt cannot find at all ("Depends: x" with nothing after it,
+    // or "Unable to locate package") usually lives in "universe".
+    let unavailable = output.lines().any(|l| {
+        let l = l.trim();
+        (l.contains("Depends:")
+            && !l.contains("but it is not")
+            && !l.contains("but it is not going to be installed"))
+            || l.contains("Unable to locate package")
+            || l.contains("has no installation candidate")
+    });
+    if unavailable {
+        help.push(
+            "Some packages are not available from your software sources. On Ubuntu they are in the \
+             \"universe\" repository; enable it and refresh the package lists:\n    \
+             sudo add-apt-repository universe\n    sudo apt update",
+        );
+    }
+    if output.contains("--fix-broken") || output.contains("Unmet dependencies") {
+        help.push(
+            "An earlier installation was left incomplete (for example a .deb installed with \
+             \"dpkg -i\"). Let apt finish it:\n    sudo apt --fix-broken install",
+        );
+    }
+    if output.contains("Could not get lock") || output.contains("is held by process") {
+        help.push("Another program (e.g. Software Updater) is installing right now. Wait for it to finish and try again.");
+    }
+    if help.is_empty() {
+        help.push("Installation failed or was cancelled.");
+    }
+    help.push("Then start 2fcast again, or install the package with:\n    sudo apt install ./2fcast_*.deb");
+    help.join("\n\n")
 }
 
 /// True if `program` is found in `$PATH`.
@@ -79,6 +135,17 @@ pub fn in_path(program: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alternatives_satisfy_a_requirement() {
+        let without_libav = missing_packages(|e| e != "avdec_h264", |_| true);
+        assert!(
+            without_libav.is_empty(),
+            "openh264dec is enough: {without_libav:?}"
+        );
+        let neither = missing_packages(|e| e != "avdec_h264" && e != "openh264dec", |_| true);
+        assert_eq!(neither, vec!["gstreamer1.0-libav"]);
+    }
 
     #[test]
     fn nothing_missing() {
@@ -102,7 +169,53 @@ mod tests {
     fn install_command_shape() {
         assert_eq!(
             install_command(&["a", "b"]),
-            vec!["pkexec", "apt-get", "install", "-y", "a", "b"]
+            vec![
+                "pkexec",
+                "sh",
+                "-c",
+                "apt-get update && apt-get install -y --fix-broken a b"
+            ]
+        );
+        assert_eq!(
+            terminal_command(&["a"]),
+            "sudo apt update && sudo apt install --fix-broken a"
+        );
+    }
+
+    /// What apt printed on a real machine with universe missing and a
+    /// half-installed .deb.
+    const BROKEN: &str = "Reading package lists... Done
+You might want to run 'apt --fix-broken install' to correct these.
+The following packages have unmet dependencies:
+ gstreamer1.0-plugins-bad : Depends: libde265-0 (>= 0.9) but it is not going to be installed
+                            Depends: libopenh264-6 (>= 2.2.0+dfsg)
+                            Depends: libzbar0 (>= 0.10) but it is not going to be installed
+E: Unmet dependencies. Try 'apt --fix-broken install' with no packages (or specify a solution).";
+
+    #[test]
+    fn explains_missing_universe_and_broken_install() {
+        let help = explain_apt_failure(BROKEN);
+        assert!(help.contains("sudo add-apt-repository universe"), "{help}");
+        assert!(help.contains("sudo apt --fix-broken install"), "{help}");
+        assert!(help.contains("sudo apt install ./2fcast_*.deb"));
+    }
+
+    #[test]
+    fn explains_other_failures() {
+        let only_broken = "E: Unmet dependencies. Try 'apt --fix-broken install'\n x : Depends: y but it is not going to be installed";
+        let help = explain_apt_failure(only_broken);
+        assert!(
+            help.contains("--fix-broken install") && !help.contains("universe"),
+            "{help}"
+        );
+        assert!(explain_apt_failure("E: Unable to locate package foo").contains("universe"));
+        assert!(
+            explain_apt_failure("E: Could not get lock /var/lib/dpkg/lock-frontend")
+                .contains("Wait")
+        );
+        assert!(
+            explain_apt_failure("Error executing command as another user: Not authorized")
+                .starts_with("Installation failed")
         );
     }
 

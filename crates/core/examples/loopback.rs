@@ -34,8 +34,8 @@ fn main() {
             "net_share",
             ports.share,
         ),
-        receive(&ch, &ports, false),
-        receive_screen(&ch, &ports, false),
+        receive(&ch, &ports, false, "avdec_h264"),
+        receive_screen(&ch, &ports, false, "avdec_h264"),
         program(&ch),
         record(&ch, 4000, "ultrafast").replace(
             "filesink name=file",

@@ -17,6 +17,10 @@ pub enum Msg {
         name: String,
         base_port: u16,
         version: u32,
+        /// How long the sender has been running: whoever runs longer joined
+        /// first (decides the default drawing colors).
+        #[serde(default)]
+        uptime_ms: u64,
     },
     /// Who owns the shared space (last writer wins by stamp).
     Presenter {
@@ -31,6 +35,9 @@ pub enum Msg {
     AnnotSync { items: Vec<Item> },
     /// Sender started or stopped recording.
     Recording { active: bool },
+    /// Whether the sender receives our camera/voice (false: packets do not
+    /// arrive, usually a firewall on the sender's side).
+    MediaReceived { ok: bool },
     /// Keep-alive.
     Ping,
 }
@@ -71,6 +78,7 @@ mod tests {
             name: "Artem\nX".into(),
             base_port: 47100,
             version: 1,
+            uptime_ms: 5,
         });
         roundtrip(Msg::Presenter {
             presenter: Some("b".into()),
@@ -92,6 +100,7 @@ mod tests {
         });
         roundtrip(Msg::AnnotSync { items: vec![] });
         roundtrip(Msg::Recording { active: true });
+        roundtrip(Msg::MediaReceived { ok: false });
         roundtrip(Msg::Ping);
     }
 

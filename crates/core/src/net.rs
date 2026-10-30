@@ -11,11 +11,11 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::PeerId;
 use crate::protocol::{Msg, PROTOCOL_VERSION, decode, encode};
-use crate::session::Peer;
+use crate::session::{Peer, peer_was_first};
 
 pub const SERVICE_TYPE: &str = "_twofcast._tcp.local.";
 const PING_EVERY: Duration = Duration::from_secs(1);
@@ -74,6 +74,7 @@ struct Shared {
     /// Peers seen via mDNS: id -> addresses.
     discovered: Mutex<HashMap<PeerId, Vec<SocketAddr>>>,
     stop: AtomicBool,
+    started: Instant,
 }
 
 pub struct Net {
@@ -96,6 +97,7 @@ impl Net {
             generation: AtomicU64::new(0),
             discovered: Mutex::new(HashMap::new()),
             stop: AtomicBool::new(false),
+            started: Instant::now(),
         });
 
         let s = shared.clone();
@@ -268,11 +270,13 @@ impl Shared {
         let _ = stream.set_nodelay(true);
         let _ = stream.set_read_timeout(Some(DEAD_AFTER));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+        let my_uptime = self.started.elapsed().as_millis() as u64;
         let hello = Msg::Hello {
             id: self.cfg.id.clone(),
             name: self.cfg.name.clone(),
             base_port: self.cfg.base_port,
             version: PROTOCOL_VERSION,
+            uptime_ms: my_uptime,
         };
         if stream.write_all(encode(&hello).as_bytes()).is_err() {
             return false;
@@ -290,6 +294,7 @@ impl Shared {
             name,
             base_port,
             version,
+            uptime_ms,
         }) = decode(&line)
         else {
             return false;
@@ -315,11 +320,13 @@ impl Shared {
                 generation,
             });
             // Emit while holding the lock so no message can overtake `Connected`.
+            let was_first = peer_was_first(my_uptime, &self.cfg.id, uptime_ms, &id);
             self.emit(NetEvent::Connected(Peer {
                 id,
                 name,
                 ip,
                 base_port,
+                was_first,
             }));
         }
 
@@ -496,6 +503,7 @@ mod tests {
             name: "A".into(),
             base_port: 1,
             version: PROTOCOL_VERSION,
+            uptime_ms: 0,
         };
         raw.write_all(encode(&hello).as_bytes()).unwrap();
         raw.write_all(b"{garbage}\n").unwrap();

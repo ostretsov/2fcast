@@ -247,6 +247,14 @@ impl Layout {
     }
 }
 
+/// New size for a shared window so it appears 1:1 in a tile of
+/// `max_w`x`max_h`: each side shrunk to fit, never enlarged.  `None` if it
+/// already fits.
+pub fn shrink_to_fit(w: u32, h: u32, max_w: u32, max_h: u32) -> Option<(u32, u32)> {
+    let new = (w.min(max_w), h.min(max_h));
+    (new != (w, h)).then_some(new)
+}
+
 /// How the canvas is fitted ("contain", centered) into a widget.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Fit {
@@ -443,6 +451,22 @@ mod tests {
         assert!(is_16_9(&r) && on_canvas(&r));
         l.scale(&id, 0.5);
         assert!(is_16_9(&l.cams["a"].rect) && on_canvas(&l.cams["a"].rect));
+    }
+
+    #[test]
+    fn shared_windows_only_shrink() {
+        assert_eq!(shrink_to_fit(2560, 1400, 1440, 810), Some((1440, 810)));
+        assert_eq!(
+            shrink_to_fit(1200, 1000, 1440, 810),
+            Some((1200, 810)),
+            "only the side that is too big"
+        );
+        assert_eq!(
+            shrink_to_fit(800, 600, 1440, 810),
+            None,
+            "small windows are not enlarged"
+        );
+        assert_eq!(shrink_to_fit(1440, 810, 1440, 810), None);
     }
 
     #[test]

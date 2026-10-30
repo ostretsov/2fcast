@@ -25,7 +25,7 @@ fn main() {
             )
         }
         Some("program") => program(&ch),
-        Some("receive") => receive(&ch, &Ports::from_base(47100), true),
+        Some("receive") => receive(&ch, &Ports::from_base(47100), true, "avdec_h264"),
         _ => "usage: describe camera|program|receive".into(),
     };
     println!("{desc}");

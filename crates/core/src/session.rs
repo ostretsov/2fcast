@@ -9,7 +9,7 @@ use std::net::IpAddr;
 use serde::{Deserialize, Serialize};
 
 use crate::PeerId;
-use crate::annotations::{AnnotOp, Annotations};
+use crate::annotations::{AnnotOp, Annotations, PALETTE, Rgb};
 use crate::layout::Layout;
 use crate::protocol::Msg;
 
@@ -63,6 +63,14 @@ pub struct Peer {
     pub name: String,
     pub ip: IpAddr,
     pub base_port: u16,
+    /// The peer was running before us (we joined second).
+    pub was_first: bool,
+}
+
+/// Whether the peer joined first: it has been running longer (ids break a
+/// tie).  Both sides come to opposite answers.
+pub fn peer_was_first(my_uptime_ms: u64, me: &PeerId, peer_uptime_ms: u64, peer: &PeerId) -> bool {
+    (peer_uptime_ms, me) > (my_uptime_ms, peer)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,6 +118,8 @@ pub struct Session {
     sharing: bool,
     pub recording: bool,
     pub peer_recording: bool,
+    /// What the peer last reported about receiving our media.
+    pub peer_receives_us: Option<bool>,
 }
 
 impl Session {
@@ -125,6 +135,17 @@ impl Session {
             sharing: false,
             recording: false,
             peer_recording: false,
+            peer_receives_us: None,
+        }
+    }
+
+    /// My drawing color until I pick one: red for whoever joined first,
+    /// green for the second.
+    pub fn my_default_color(&self) -> Rgb {
+        if self.peer.as_ref().is_some_and(|p| p.was_first) {
+            PALETTE[2]
+        } else {
+            PALETTE[0]
         }
     }
 
@@ -189,6 +210,7 @@ impl Session {
 
     pub fn connected(&mut self, peer: Peer) -> Out {
         self.peer = Some(peer);
+        self.peer_receives_us = None;
         let ids = self.active_ids();
         let mut out = Out::default()
             .event(Event::PeerChanged)
@@ -211,6 +233,7 @@ impl Session {
     pub fn disconnected(&mut self) -> Out {
         let was_presenting = self.peer_is_presenting();
         self.peer = None;
+        self.peer_receives_us = None;
         let mut out = Out::default().event(Event::PeerChanged);
         if was_presenting {
             out = out.event(Event::PresenterChanged);
@@ -325,6 +348,10 @@ impl Session {
                 self.peer_recording = active;
                 Out::default().event(Event::RecordingChanged)
             }
+            Msg::MediaReceived { ok } => {
+                self.peer_receives_us = Some(ok);
+                Out::default().event(Event::PeerChanged)
+            }
             Msg::Hello { .. } | Msg::Ping => Out::default(),
         }
     }
@@ -342,7 +369,25 @@ mod tests {
             name: id.to_uppercase(),
             ip: "127.0.0.1".parse().unwrap(),
             base_port: 1,
+            was_first: false,
         }
+    }
+
+    #[test]
+    fn first_to_join_draws_red_second_green() {
+        let (a, b): (PeerId, PeerId) = ("a".into(), "b".into());
+        assert!(peer_was_first(1_000, &a, 5_000, &b));
+        assert!(!peer_was_first(5_000, &b, 1_000, &a));
+        // Same uptime: exactly one of them is first.
+        assert_ne!(peer_was_first(7, &a, 7, &b), peer_was_first(7, &b, 7, &a));
+
+        let mut s = Session::new(a, "A".into(), Layout::preset(Preset::CamsOnly, &[]));
+        assert_eq!(s.my_default_color(), PALETTE[0], "alone: red");
+        s.connected(Peer {
+            was_first: true,
+            ..peer("b")
+        });
+        assert_eq!(s.my_default_color(), PALETTE[2], "joined second: green");
     }
 
     /// Two sessions wired together: delivers all messages until quiet.
@@ -563,6 +608,17 @@ mod tests {
         let ob = p.b.connected(peer("a"));
         p.deliver(oa.send, ob.send);
         assert_eq!(p.b.annotations.items().len(), 1);
+    }
+
+    #[test]
+    fn peer_reports_whether_our_media_arrives() {
+        let mut p = Pair::new();
+        assert_eq!(p.a.peer_receives_us, None, "unknown until reported");
+        let o = p.a.handle(Msg::MediaReceived { ok: false });
+        assert!(o.has(Event::PeerChanged));
+        assert_eq!(p.a.peer_receives_us, Some(false));
+        p.a.disconnected();
+        assert_eq!(p.a.peer_receives_us, None, "forgotten on disconnect");
     }
 
     #[test]
