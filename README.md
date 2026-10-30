@@ -76,7 +76,7 @@ video podcast on Ubuntu:
 On each machine (Ubuntu 22.04 or newer, X11 session):
 
 ```sh
-sudo apt install ./2fcast_0.4.0_amd64.deb
+sudo apt install ./2fcast_0.4.1_amd64.deb
 ```
 
 The package is self-contained, like Discord: it brings its own GTK 4,
@@ -91,7 +91,7 @@ Build the package yourself (on the *oldest* Ubuntu it should run on):
 ```sh
 curl https://sh.rustup.rs -sSf | sh       # Rust, once
 make deps                                 # build dependencies, once (sudo)
-make deb                                  # -> target/2fcast_0.4.0_amd64.deb
+make deb                                  # -> target/2fcast_0.4.1_amd64.deb
 make deb V=0.3.1                          # bump the version (crates, Cargo.lock, README), then build
 make docker-test                          # install it in clean Ubuntu containers + self-test
 ```
