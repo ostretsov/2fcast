@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -15,7 +15,7 @@ use twofcast_core::annotations::{
 use twofcast_core::config::{self, Config};
 use twofcast_core::control;
 use twofcast_core::deps;
-use twofcast_core::layout::{CANVAS_H, CANVAS_W, Fit, Layout, Preset, Rect, TileId};
+use twofcast_core::layout::{CANVAS_H, CANVAS_W, Fit, Layout, PadParams, Preset, Rect, TileId};
 use twofcast_core::levels;
 use twofcast_core::mic_channel::Mode as MicMode;
 use twofcast_core::net::{Net, NetConfig, NetEvent};
@@ -75,6 +75,7 @@ const CSS: &str = "
 .recording { background: #c01c28; color: white; }
 .preview { background: #111; }
 .error-bar { color: #e01b24; padding: 2px 8px; }
+.recording-status { color: #e01b24; font-weight: bold; }
 ";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -115,6 +116,8 @@ struct Ui {
     text_popover: gtk::Popover,
     text_view: gtk::TextView,
     meters: gtk::DrawingArea,
+    /// "Artem recording 00:12", one line per machine that records.
+    recording_status: gtk::Label,
     /// Color buttons, in [`PALETTE`] order.
     swatches: Vec<gtk::ToggleButton>,
 }
@@ -146,8 +149,14 @@ pub struct App {
     typing: Option<u64>,
     /// The user chose a color; otherwise it follows `my_default_color`.
     color_picked: bool,
-    rec_started: Option<Instant>,
     frame_serial: u64,
+    /// File being recorded on this machine.
+    recording_file: Option<PathBuf>,
+    /// Button choices remembered across restarts (e.g. hidden self-view).
+    prefs: config::UiPrefs,
+    /// What I shared last, to share it again when the partner, who took the
+    /// shared space over, stops sharing.
+    last_share: Option<(ScreenSource, Option<Target>)>,
     /// What we last told the peer about receiving their media.
     reported_receiving: Option<bool>,
     ui: Ui,
@@ -459,7 +468,8 @@ fn build(
         .unwrap_or_else(|| Layout::preset(Preset::ScreenCamsRight, std::slice::from_ref(&cfg.id)));
     let session = Session::new(cfg.id.clone(), cfg.name.clone(), layout);
 
-    let ui = build_widgets(gapp, &cfg);
+    let ui = build_widgets(gapp, &cfg, &cfg_dir);
+    let prefs = config::load_ui_prefs(&cfg_dir);
     let app: Shared = Rc::new(RefCell::new(App {
         cfg,
         cfg_dir,
@@ -482,8 +492,10 @@ fn build(
         text_at: None,
         typing: None,
         color_picked: false,
-        rec_started: None,
         frame_serial: 0,
+        recording_file: None,
+        prefs,
+        last_share: None,
         reported_receiving: None,
         ui,
     }));
@@ -531,7 +543,7 @@ fn build(
     Ok(())
 }
 
-fn build_widgets(gapp: &gtk::Application, cfg: &Config) -> Ui {
+fn build_widgets(gapp: &gtk::Application, cfg: &Config, cfg_dir: &std::path::Path) -> Ui {
     let window = gtk::ApplicationWindow::builder()
         .application(gapp)
         .title("2fcast")
@@ -564,6 +576,14 @@ fn build_widgets(gapp: &gtk::Application, cfg: &Config) -> Ui {
     record.set_widget_name("record");
     let mic = gtk::ToggleButton::with_label("Mic on");
     mic.set_widget_name("mic");
+    let self_view = gtk::ToggleButton::builder()
+        .label("Self-view on")
+        .tooltip_text(
+            "Hide your own camera on your screen, so seeing yourself doesn't distract you. \
+             Your partner still sees you and the recording still includes you.",
+        )
+        .build();
+    self_view.set_widget_name("self-view");
     let layout_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     layout_box.set_widget_name("layout-box");
     let layout_button = gtk::MenuButton::builder()
@@ -575,6 +595,7 @@ fn build_widgets(gapp: &gtk::Application, cfg: &Config) -> Ui {
     arrange_slot.set_widget_name("arrange-slot");
     header.pack_end(&record);
     header.pack_end(&mic);
+    header.pack_end(&self_view);
     header.pack_end(&layout_button);
     header.pack_end(&arrange_slot);
     window.set_titlebar(Some(&header));
@@ -631,33 +652,72 @@ fn build_widgets(gapp: &gtk::Application, cfg: &Config) -> Ui {
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
     error.add_css_class("error-bar");
-    let footer = gtk::Label::builder()
-        .label(format!(
-            "You are {} · recordings go to {} · log: {}",
-            cfg.name,
-            cfg.output_dir.display(),
-            crate::log::path().display()
-        ))
-        .xalign(1.0)
-        .css_classes(["dim-label"])
+    // Clickable paths: open the folder (created if needed) in the file manager.
+    let folder_link = |title: &str, tooltip: &str, path: &std::path::Path, folder: PathBuf| {
+        let text = glib::markup_escape_text(&path.display().to_string());
+        let label = gtk::Label::builder()
+            .use_markup(true)
+            .label(format!("{title}: <a href=\"open\">{text}</a>"))
+            .xalign(1.0)
+            .tooltip_text(tooltip)
+            .build();
+        label.connect_activate_link(move |_, _| {
+            let _ = std::fs::create_dir_all(&folder);
+            if let Err(e) = std::process::Command::new("xdg-open").arg(&folder).spawn() {
+                crate::log::write(&format!("cannot open {}: {e}", folder.display()));
+            }
+            glib::Propagation::Stop
+        });
+        label
+    };
+    let log_path = crate::log::path();
+    let log_dir = log_path.parent().map(PathBuf::from).unwrap_or_default();
+    let folder_links = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .valign(gtk::Align::Center)
+        .halign(gtk::Align::End)
         .margin_end(8)
-        .hexpand(true)
+        .css_classes(["dim-label"])
         .build();
+    folder_links.append(&folder_link(
+        "Recordings",
+        "Open the recordings folder",
+        &cfg.output_dir,
+        cfg.output_dir.clone(),
+    ));
+    folder_links.append(&folder_link(
+        "Log",
+        "Open the folder with the log",
+        &log_path,
+        log_dir,
+    ));
     let meters = gtk::DrawingArea::builder()
         .content_width(470)
         .content_height(METER_HEIGHT)
         .margin_start(8)
         .margin_top(2)
         .margin_bottom(2)
-        .tooltip_text(
-            "Voice levels in dBFS. Speech should stay in the green; red will distort. \
+        .tooltip_text(format!(
+            "You are {}, you can change this name in {}\n\n\
+             Voice levels in dBFS. Speech should stay in the green; red will distort. \
              The dashed blue mark is the noise gate: quieter sound is muted.",
-        )
+            cfg.name,
+            cfg_dir.join("config.toml").display()
+        ))
         .build();
+    let recording_status = gtk::Label::builder()
+        .xalign(0.0)
+        .valign(gtk::Align::Center)
+        .margin_start(12)
+        .visible(false)
+        .css_classes(["recording-status"])
+        .build();
+    error.set_hexpand(true);
     let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     bottom.append(&meters);
+    bottom.append(&recording_status);
     bottom.append(&error);
-    bottom.append(&footer);
+    bottom.append(&folder_links);
 
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let warning = gtk::Label::builder()
@@ -688,6 +748,7 @@ fn build_widgets(gapp: &gtk::Application, cfg: &Config) -> Ui {
         text_popover,
         text_view,
         meters,
+        recording_status,
         swatches: vec![],
     }
 }
@@ -927,6 +988,17 @@ fn connect_signals(app: &Shared) {
         mic.set_label("No mic");
         mic.set_sensitive(false);
     }
+    let self_view = find::<gtk::ToggleButton>(&window, "self-view").unwrap();
+    if !app.borrow().media.has_camera() {
+        self_view.set_visible(false);
+    }
+    let a = app.clone();
+    self_view.connect_toggled(move |b| {
+        let hidden = b.is_active();
+        with(&a, move |app| app.set_self_view_hidden(hidden));
+    });
+    let hidden = app.borrow().prefs.hide_self_view;
+    app.borrow().sync_self_view_button(hidden);
     let a = app.clone();
     mic.connect_toggled(move |b| {
         let muted = b.is_active();
@@ -1137,6 +1209,29 @@ impl App {
             eprintln!("[2fcast] saving layout: {e}");
         }
         self.refresh_ui();
+        if out.has(Event::ResumeSharing) {
+            self.resume_sharing();
+        }
+    }
+
+    /// The partner stopped sharing after taking over from me: share again
+    /// what I shared before, if that window still exists.
+    fn resume_sharing(&mut self) {
+        let Some((src, target)) = self.last_share.clone() else {
+            return;
+        };
+        if let ScreenSource::Window(xid) = src {
+            let exists = windows::list()
+                .map(|ws| ws.iter().any(|w| w.xid as u64 == xid))
+                .unwrap_or(false);
+            if !exists {
+                debug(&format!("not resuming share: window {xid:#x} is gone"));
+                self.last_share = None;
+                return;
+            }
+        }
+        debug("partner stopped sharing: sharing my window again");
+        self.start_sharing(src, target);
     }
 
     /// Shared-space rectangle on the canvas, if something is being shown.
@@ -1216,15 +1311,6 @@ impl App {
                 status += &format!(" · {} is sharing", s.display_name(p));
             }
         }
-        if s.peer_recording {
-            status += &format!(
-                " · ● {} is recording",
-                s.peer
-                    .as_ref()
-                    .map(|p| p.name.as_str())
-                    .unwrap_or("partner")
-            );
-        }
         self.ui.status.set_text(&status);
         let warning = self.connection_warning();
         if warning != self.ui.warning.text().as_str() && !warning.is_empty() {
@@ -1233,11 +1319,16 @@ impl App {
         self.ui.warning.set_text(&warning);
         self.ui.warning.set_visible(!warning.is_empty());
         self.ui.stop_share.set_sensitive(s.is_presenting());
-        match self.rec_started {
+        self.update_recording_status();
+        let free = self
+            .disk_free_bytes()
+            .map(|b| format!(" · {} free", config::human_size(b)))
+            .unwrap_or_default();
+        match self.session.recording_since {
             Some(t) => {
                 let secs = t.elapsed().as_secs();
                 self.ui.record.set_label(&format!(
-                    "■ Stop {:02}:{:02}:{:02}",
+                    "■ Stop {:02}:{:02}:{:02}{free}",
                     secs / 3600,
                     secs / 60 % 60,
                     secs % 60
@@ -1245,11 +1336,54 @@ impl App {
                 self.ui.record.add_css_class("recording");
             }
             None => {
-                self.ui.record.set_label("● Record");
+                self.ui.record.set_label(&format!("● Record{free}"));
                 self.ui.record.remove_css_class("recording");
             }
         }
         self.ui.area.queue_draw();
+    }
+
+    /// "Artem recording 01:05" (hh:mm) for each machine that records; my own
+    /// line adds the file size (free space is on the Record button).
+    fn update_recording_status(&self) {
+        let mut lines: Vec<String> = self
+            .session
+            .recording_timers()
+            .iter()
+            .map(|(name, d)| {
+                let m = d.as_secs() / 60;
+                format!("● {name} recording {:02}:{:02}", m / 60, m % 60)
+            })
+            .collect();
+        if self.session.is_recording()
+            && let Some(mine) = lines.first_mut()
+            && let Some(size) = self.recording_file_bytes()
+        {
+            *mine += &format!(" · {}", config::human_size(size));
+        }
+        let text = lines.join("\n");
+        if text != self.ui.recording_status.text().as_str() {
+            self.ui.recording_status.set_text(&text);
+        }
+        self.ui.recording_status.set_visible(!text.is_empty());
+    }
+
+    fn recording_file_bytes(&self) -> Option<u64> {
+        let path = self.recording_file.as_ref()?;
+        std::fs::metadata(path).ok().map(|m| m.len())
+    }
+
+    /// Free space on the disk recordings are written to (the output folder,
+    /// or its nearest existing parent before the first recording).
+    fn disk_free_bytes(&self) -> Option<u64> {
+        let dir = match &self.recording_file {
+            Some(f) => f.parent()?,
+            None => self.cfg.output_dir.ancestors().find(|d| d.exists())?,
+        };
+        gio::File::for_path(dir)
+            .query_filesystem_info(gio::FILE_ATTRIBUTE_FILESYSTEM_FREE, gio::Cancellable::NONE)
+            .ok()
+            .map(|i| i.attribute_uint64(gio::FILE_ATTRIBUTE_FILESYSTEM_FREE))
     }
 
     fn fill_share_list(&self, shared: &Shared) {
@@ -1321,6 +1455,7 @@ impl App {
                 Err(e) => eprintln!("[2fcast] resizing the shared window: {e:#}"),
             }
         }
+        let resume = (src.clone(), target.clone());
         let target = target.filter(|_| app.cfg.share_sound);
         app.share_audio = target.and_then(|t| match ShareAudio::start(t) {
             Ok(s) => Some(s),
@@ -1341,6 +1476,7 @@ impl App {
             return;
         }
         app.ui.error.set_text("");
+        app.last_share = Some(resume);
         let out = app.session.start_presenting();
         app.apply(out);
     }
@@ -1380,7 +1516,7 @@ impl App {
     fn toggle_recording(&mut self, shared: &Shared) {
         let app = self;
         if let Some(rx) = app.media.stop_recording() {
-            app.rec_started = None;
+            app.recording_file = None;
             app.ui.record.set_sensitive(false);
             let out = app.session.set_recording(false);
             app.apply(out);
@@ -1415,10 +1551,8 @@ impl App {
         match app.media.start_recording(&path, kbps, &preset, &names) {
             Ok(()) => {
                 debug(&format!("recording to {}", path.display()));
-                app.rec_started = Some(Instant::now());
-                app.ui
-                    .error
-                    .set_text(&format!("Recording to {}", path.display()));
+                app.recording_file = Some(path.clone());
+                app.ui.error.set_text("");
                 let out = app.session.set_recording(true);
                 app.apply(out);
             }
@@ -1483,6 +1617,10 @@ impl App {
             }
             C::Mute { on } => {
                 self.set_muted(on);
+                Ok(())
+            }
+            C::HideSelfView { on } => {
+                self.set_self_view_hidden(on);
                 Ok(())
             }
             C::Preset { name } => match control::parse_preset(&name) {
@@ -1596,8 +1734,13 @@ impl App {
                 was_maximized: w.maximized,
             }),
             recording: self.media.is_recording(),
-            peer_recording: s.peer_recording,
+            peer_recording: s.peer_is_recording(),
+            recording_secs: s.recording_since.map(|t| t.elapsed().as_secs()),
+            peer_recording_secs: s.peer_recording_since.map(|t| t.elapsed().as_secs()),
+            recording_file_bytes: self.recording_file_bytes(),
+            disk_free_bytes: self.disk_free_bytes(),
             muted: self.media.is_mic_muted(),
+            self_view_hidden: self.prefs.hide_self_view,
             mic_channel: self
                 .media
                 .has_mic()
@@ -1897,10 +2040,29 @@ impl App {
         for (row, (name, level)) in [(me, mine), (peer, theirs)].into_iter().enumerate() {
             let y = 12.0 + row as f64 * 17.0;
             let (bar_y, bar_h) = (y + 2.0, 11.0);
+            // My own name in bold (the tooltip says where to change it).
+            cr.select_font_face(
+                "Sans",
+                gtk::cairo::FontSlant::Normal,
+                if row == 0 {
+                    gtk::cairo::FontWeight::Bold
+                } else {
+                    gtk::cairo::FontWeight::Normal
+                },
+            );
             cr.set_font_size(11.0);
-            cr.set_source_rgba(0.55, 0.55, 0.55, 1.0);
+            if row == 0 {
+                cr.set_source_rgba(0.45, 0.45, 0.45, 1.0);
+            } else {
+                cr.set_source_rgba(0.55, 0.55, 0.55, 1.0);
+            }
             cr.move_to(0.0, y + 11.0);
             let _ = cr.show_text(&ellipsize(cr, &name, name_w - 8.0));
+            cr.select_font_face(
+                "Sans",
+                gtk::cairo::FontSlant::Normal,
+                gtk::cairo::FontWeight::Normal,
+            );
             // Track with zone tints, so the scale reads even in silence.
             for (from, to, rgb) in [
                 (levels::FLOOR_DB, -12.0, ZONE_GREEN),
@@ -1969,6 +2131,132 @@ impl App {
             b.set_active(on);
         }
         self.ui.area.queue_draw();
+    }
+
+    /// Hides or shows my own camera on my screen only (button, control API).
+    fn set_self_view_hidden(&mut self, on: bool) {
+        if self.prefs.hide_self_view != on {
+            self.prefs.hide_self_view = on;
+            if let Err(e) = config::save_ui_prefs(&self.cfg_dir, &self.prefs) {
+                debug(&format!("cannot save ui prefs: {e:#}"));
+            }
+        }
+        self.sync_self_view_button(on);
+        self.ui.area.queue_draw();
+    }
+
+    fn sync_self_view_button(&self, hidden: bool) {
+        if let Some(b) = find::<gtk::ToggleButton>(&self.ui.window, "self-view") {
+            if b.is_active() != hidden {
+                b.set_active(hidden);
+            }
+            b.set_label(if hidden {
+                "Self-view off"
+            } else {
+                "Self-view on"
+            });
+        }
+    }
+
+    /// Covers my camera tile on my screen (where it is not under the
+    /// partner's camera) with a "camera off" sign.
+    fn draw_hidden_self_view(&self, cr: &gtk::cairo::Context, fit: &Fit) {
+        let s = &self.session;
+        let pads = s.layout().pads(&s.me, s.peer_id(), s.presenter());
+        let (mine, theirs) = (pads.cam_local, pads.cam_remote);
+        if mine.alpha <= 0.0 {
+            return;
+        }
+        let rect =
+            |p: PadParams| fit.to_widget(Rect::new(p.x as f64, p.y as f64, p.w as f64, p.h as f64));
+        let r = rect(mine);
+        cr.save().ok();
+        cr.rectangle(r.x, r.y, r.w, r.h);
+        cr.clip();
+        cr.rectangle(r.x, r.y, r.w, r.h);
+        if theirs.alpha > 0.0 && theirs.zorder > mine.zorder {
+            let o = rect(theirs);
+            cr.rectangle(o.x, o.y, o.w, o.h);
+            cr.set_fill_rule(gtk::cairo::FillRule::EvenOdd);
+        }
+        cr.set_source_rgb(0.16, 0.16, 0.18);
+        let _ = cr.fill();
+        cr.set_fill_rule(gtk::cairo::FillRule::Winding);
+
+        // Camera body and lens, crossed out.
+        let s = (r.w.min(r.h) * 0.45).min(160.0);
+        let (cx, cy) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
+        let (bw, bh) = (s * 0.55, s * 0.4);
+        let (bx, by) = (cx - s * 0.4, cy - bh / 2.0);
+        cr.set_source_rgba(0.85, 0.85, 0.85, 1.0);
+        let rad = bh * 0.18;
+        cr.new_sub_path();
+        cr.arc(
+            bx + bw - rad,
+            by + rad,
+            rad,
+            -std::f64::consts::FRAC_PI_2,
+            0.0,
+        );
+        cr.arc(
+            bx + bw - rad,
+            by + bh - rad,
+            rad,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+        );
+        cr.arc(
+            bx + rad,
+            by + bh - rad,
+            rad,
+            std::f64::consts::FRAC_PI_2,
+            std::f64::consts::PI,
+        );
+        cr.arc(
+            bx + rad,
+            by + rad,
+            rad,
+            std::f64::consts::PI,
+            1.5 * std::f64::consts::PI,
+        );
+        cr.close_path();
+        let _ = cr.fill();
+        cr.move_to(bx + bw + s * 0.03, cy);
+        cr.line_to(bx + bw + s * 0.25, cy - bh * 0.4);
+        cr.line_to(bx + bw + s * 0.25, cy + bh * 0.4);
+        cr.close_path();
+        let _ = cr.fill();
+        let (a, b) = (
+            (cx - s * 0.42, cy - s * 0.38),
+            (cx + s * 0.42, cy + s * 0.38),
+        );
+        cr.set_line_cap(gtk::cairo::LineCap::Round);
+        cr.set_line_width(s * 0.11);
+        cr.set_source_rgb(0.16, 0.16, 0.18);
+        cr.move_to(a.0, a.1);
+        cr.line_to(b.0, b.1);
+        let _ = cr.stroke();
+        cr.set_line_width(s * 0.06);
+        cr.set_source_rgb(0.9, 0.12, 0.15);
+        cr.move_to(a.0, a.1);
+        cr.line_to(b.0, b.1);
+        let _ = cr.stroke();
+
+        // Caption, if the tile is big enough to read it.
+        let text = "Hidden only for you";
+        cr.select_font_face(
+            "Sans",
+            gtk::cairo::FontSlant::Normal,
+            gtk::cairo::FontWeight::Normal,
+        );
+        cr.set_font_size(12.0);
+        let tw = cr.text_extents(text).map(|e| e.width()).unwrap_or(0.0);
+        if tw + 16.0 < r.w && r.h > s + 40.0 {
+            cr.set_source_rgba(0.75, 0.75, 0.75, 1.0);
+            cr.move_to(cx - tw / 2.0, cy + s / 2.0 + 18.0);
+            let _ = cr.show_text(text);
+        }
+        cr.restore().ok();
     }
 
     /// Where the "muted" sign is shown (canvas px): over the shared space, or
@@ -2070,6 +2358,9 @@ impl App {
                 r,
                 (0.8, 0.8, 0.8),
             );
+        }
+        if self.prefs.hide_self_view && self.media.has_camera() {
+            self.draw_hidden_self_view(cr, &fit);
         }
         if self.tool == Tool::Arrange {
             let mut tiles = vec![(String::from("Shared space"), l.screen)];

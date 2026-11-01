@@ -445,15 +445,27 @@ mod tests {
         assert_eq!(peer.id, "a");
         assert!(a.is_connected() && b.is_connected());
 
-        a.send(&Msg::Recording { active: true });
+        a.send(&Msg::Recording {
+            active: true,
+            elapsed_ms: 0,
+        });
         match next(&rx_b, 5) {
-            NetEvent::Message(Msg::Recording { active: true }) => {}
+            NetEvent::Message(Msg::Recording {
+                active: true,
+                elapsed_ms: 0,
+            }) => {}
             e => panic!("{e:?}"),
         }
-        b.send(&Msg::Recording { active: false });
+        b.send(&Msg::Recording {
+            active: false,
+            elapsed_ms: 0,
+        });
         assert!(matches!(
             next(&rx_a, 5),
-            NetEvent::Message(Msg::Recording { active: false })
+            NetEvent::Message(Msg::Recording {
+                active: false,
+                elapsed_ms: 0
+            })
         ));
 
         drop(b);
@@ -507,12 +519,21 @@ mod tests {
         };
         raw.write_all(encode(&hello).as_bytes()).unwrap();
         raw.write_all(b"{garbage}\n").unwrap();
-        raw.write_all(encode(&Msg::Recording { active: true }).as_bytes())
-            .unwrap();
+        raw.write_all(
+            encode(&Msg::Recording {
+                active: true,
+                elapsed_ms: 0,
+            })
+            .as_bytes(),
+        )
+        .unwrap();
         assert!(matches!(next(&rx_b, 5), NetEvent::Connected(_)));
         assert!(matches!(
             next(&rx_b, 5),
-            NetEvent::Message(Msg::Recording { active: true })
+            NetEvent::Message(Msg::Recording {
+                active: true,
+                elapsed_ms: 0
+            })
         ));
     }
 

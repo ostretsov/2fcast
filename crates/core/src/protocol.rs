@@ -33,8 +33,13 @@ pub enum Msg {
     Annot { op: AnnotOp },
     /// Full set of annotations, sent after connecting.
     AnnotSync { items: Vec<Item> },
-    /// Sender started or stopped recording.
-    Recording { active: bool },
+    /// Sender started or stopped recording; `elapsed_ms`: how long it has
+    /// been recording (so a reconnecting peer shows the right time).
+    Recording {
+        active: bool,
+        #[serde(default)]
+        elapsed_ms: u64,
+    },
     /// Whether the sender receives our camera/voice (false: packets do not
     /// arrive, usually a firewall on the sender's side).
     MediaReceived { ok: bool },
@@ -99,7 +104,10 @@ mod tests {
             },
         });
         roundtrip(Msg::AnnotSync { items: vec![] });
-        roundtrip(Msg::Recording { active: true });
+        roundtrip(Msg::Recording {
+            active: true,
+            elapsed_ms: 61_000,
+        });
         roundtrip(Msg::MediaReceived { ok: false });
         roundtrip(Msg::Ping);
     }
@@ -108,6 +116,17 @@ mod tests {
     fn decode_rejects_garbage() {
         assert!(decode("not json").is_err());
         assert!(decode(r#"{"type":"unknown"}"#).is_err());
+    }
+
+    #[test]
+    fn recording_from_older_peer_has_no_elapsed_time() {
+        assert_eq!(
+            decode(r#"{"type":"recording","active":true}"#).unwrap(),
+            Msg::Recording {
+                active: true,
+                elapsed_ms: 0
+            }
+        );
     }
 
     #[test]

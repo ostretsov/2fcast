@@ -140,6 +140,28 @@ pub fn save_layout(dir: &Path, layout: &Layout) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Choices made with buttons that should survive a restart (`ui.json`;
+/// kept apart from `config.toml`, which the user edits by hand).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(default)]
+pub struct UiPrefs {
+    /// My own camera is covered on my screen (still sent and recorded).
+    pub hide_self_view: bool,
+}
+
+pub fn load_ui_prefs(dir: &Path) -> UiPrefs {
+    std::fs::read_to_string(dir.join("ui.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_ui_prefs(dir: &Path, prefs: &UiPrefs) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join("ui.json"), serde_json::to_string_pretty(prefs)?)?;
+    Ok(())
+}
+
 /// A new, not yet existing file name for a recording started at `now`.
 pub fn recording_path(dir: &Path, now: chrono::NaiveDateTime) -> PathBuf {
     let stem = format!("2fcast_{}", now.format("%Y-%m-%d_%H-%M-%S"));
@@ -152,8 +174,48 @@ pub fn recording_path(dir: &Path, now: chrono::NaiveDateTime) -> PathBuf {
     path
 }
 
+/// File and disk sizes for people: "850 MB", "12.4 GB" (decimal units, as
+/// the file manager shows them).
+pub fn human_size(bytes: u64) -> String {
+    const MB: f64 = 1e6;
+    const GB: f64 = 1e9;
+    let b = bytes as f64;
+    if b >= 100.0 * GB {
+        format!("{:.0} GB", b / GB)
+    } else if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= 10.0 * MB {
+        format!("{:.0} MB", b / MB)
+    } else {
+        format!("{:.1} MB", b / MB)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ui_prefs_roundtrip_and_default() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_ui_prefs(dir.path()), UiPrefs::default());
+        let p = UiPrefs {
+            hide_self_view: true,
+        };
+        save_ui_prefs(dir.path(), &p).unwrap();
+        assert_eq!(load_ui_prefs(dir.path()), p);
+        std::fs::write(dir.path().join("ui.json"), "garbage").unwrap();
+        assert_eq!(load_ui_prefs(dir.path()), UiPrefs::default());
+    }
+
+    #[test]
+    fn sizes_read_like_the_file_manager() {
+        assert_eq!(human_size(0), "0.0 MB");
+        assert_eq!(human_size(389_676), "0.4 MB");
+        assert_eq!(human_size(152_400_000), "152 MB");
+        assert_eq!(human_size(999_000_000), "999 MB");
+        assert_eq!(human_size(12_440_000_000), "12.4 GB");
+        assert_eq!(human_size(250_300_000_000), "250 GB");
+    }
+
     use super::*;
     use crate::layout::Preset;
 

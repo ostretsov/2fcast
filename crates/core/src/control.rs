@@ -10,6 +10,7 @@
 //! {"cmd":"stop_sharing"}
 //! {"cmd":"record","on":true}
 //! {"cmd":"mute","on":true}
+//! {"cmd":"hide_self_view","on":true}  // my camera hidden on my screen only
 //! {"cmd":"preset","name":"cams_only"}
 //! {"cmd":"draw","points":[[0.1,0.1],[0.5,0.5]]}
 //! {"cmd":"text","x":0.1,"y":0.2,"text":"hello"}
@@ -41,6 +42,11 @@ pub enum Command {
         on: bool,
     },
     Mute {
+        on: bool,
+    },
+    /// Covers my own camera on my screen; the partner and the recording
+    /// still get it.
+    HideSelfView {
         on: bool,
     },
     Preset {
@@ -110,7 +116,20 @@ pub struct State {
     pub shared_window: Option<SharedWindow>,
     pub recording: bool,
     pub peer_recording: bool,
+    /// How long this machine / the peer has been recording.
+    #[serde(default)]
+    pub recording_secs: Option<u64>,
+    #[serde(default)]
+    pub peer_recording_secs: Option<u64>,
+    /// Size of the file being recorded here.
+    #[serde(default)]
+    pub recording_file_bytes: Option<u64>,
+    /// Free space on the disk recordings go to (also when not recording).
+    #[serde(default)]
+    pub disk_free_bytes: Option<u64>,
     pub muted: bool,
+    #[serde(default)]
+    pub self_view_hidden: bool,
     /// "Both", "Left" or "Right": microphone input channel(s) in use.
     pub mic_channel: Option<String>,
     pub my_level_db: Option<f64>,
@@ -185,6 +204,10 @@ mod tests {
         assert_eq!(
             parse(r#" {"cmd":"record","on":true} "#),
             Ok(Command::Record { on: true })
+        );
+        assert_eq!(
+            parse(r#"{"cmd":"hide_self_view","on":false}"#),
+            Ok(Command::HideSelfView { on: false })
         );
         assert_eq!(
             parse(r#"{"cmd":"draw","points":[[0.1,0.2],[0.3,0.4]]}"#),

@@ -5,6 +5,7 @@
 //! value on both machines.  Annotations are an append-only list of operations.
 
 use std::net::IpAddr;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -80,6 +81,9 @@ pub enum Event {
     LayoutChanged,
     AnnotationsChanged,
     RecordingChanged,
+    /// The peer stopped sharing after taking the shared space over from me:
+    /// share again what I shared before.
+    ResumeSharing,
 }
 
 /// Result of handling an input: messages to send to the peer and what changed.
@@ -116,8 +120,13 @@ pub struct Session {
     pub annotations: Annotations,
     /// True while this machine actually captures and sends its window.
     sharing: bool,
-    pub recording: bool,
-    pub peer_recording: bool,
+    /// The peer took the shared space over while I was sharing; when they
+    /// stop, my share comes back.
+    share_interrupted: bool,
+    /// When this machine started recording.
+    pub recording_since: Option<Instant>,
+    /// When the peer started recording (from its reported elapsed time).
+    pub peer_recording_since: Option<Instant>,
     /// What the peer last reported about receiving our media.
     pub peer_receives_us: Option<bool>,
 }
@@ -133,8 +142,9 @@ impl Session {
             peer: None,
             annotations: Annotations::default(),
             sharing: false,
-            recording: false,
-            peer_recording: false,
+            share_interrupted: false,
+            recording_since: None,
+            peer_recording_since: None,
             peer_receives_us: None,
         }
     }
@@ -224,8 +234,8 @@ impl Session {
             .send(Msg::AnnotSync {
                 items: self.annotations.items().to_vec(),
             });
-        if self.recording {
-            out = out.send(Msg::Recording { active: true });
+        if self.is_recording() {
+            out = out.send(self.recording_msg());
         }
         out
     }
@@ -238,7 +248,7 @@ impl Session {
         if was_presenting {
             out = out.event(Event::PresenterChanged);
         }
-        if std::mem::take(&mut self.peer_recording) {
+        if self.peer_recording_since.take().is_some() {
             out = out.event(Event::RecordingChanged);
         }
         out
@@ -248,6 +258,7 @@ impl Session {
 
     pub fn start_presenting(&mut self) -> Out {
         self.sharing = true;
+        self.share_interrupted = false;
         let stamp = self.presenter.set_local(Some(self.me.clone()), &self.me);
         self.annotations.clear();
         Out::default()
@@ -261,6 +272,7 @@ impl Session {
 
     pub fn stop_presenting(&mut self) -> Out {
         self.sharing = false;
+        self.share_interrupted = false;
         if self.presenter.value.as_ref() != Some(&self.me) {
             return Out::default();
         }
@@ -293,10 +305,40 @@ impl Session {
     }
 
     pub fn set_recording(&mut self, active: bool) -> Out {
-        self.recording = active;
+        self.recording_since = active.then(Instant::now);
         Out::default()
             .event(Event::RecordingChanged)
-            .send(Msg::Recording { active })
+            .send(self.recording_msg())
+    }
+
+    fn recording_msg(&self) -> Msg {
+        Msg::Recording {
+            active: self.is_recording(),
+            elapsed_ms: self
+                .recording_since
+                .map_or(0, |t| t.elapsed().as_millis() as u64),
+        }
+    }
+
+    pub fn is_recording(&self) -> bool {
+        self.recording_since.is_some()
+    }
+
+    pub fn peer_is_recording(&self) -> bool {
+        self.peer_recording_since.is_some()
+    }
+
+    /// Who is recording and for how long, me first.
+    pub fn recording_timers(&self) -> Vec<(String, Duration)> {
+        let mut v = vec![];
+        if let Some(t) = self.recording_since {
+            v.push((self.my_name.clone(), t.elapsed()));
+        }
+        if let Some(t) = self.peer_recording_since {
+            let name = self.peer.as_ref().map_or("Partner", |p| p.name.as_str());
+            v.push((name.to_string(), t.elapsed()));
+        }
+        v
     }
 
     // ---- remote messages ----
@@ -305,10 +347,22 @@ impl Session {
         match msg {
             Msg::Presenter { presenter, stamp } => {
                 let before = self.presenter.value.clone();
+                let was_sharing = self.sharing;
                 if !self.presenter.merge(presenter, stamp) {
                     return Out::default();
                 }
                 let mut out = Out::default();
+                let now = self.presenter.value.as_ref();
+                let peer_has_it = now.is_some() && now == self.peer_id();
+                if was_sharing && peer_has_it {
+                    self.share_interrupted = true;
+                } else if now.is_none() && before.is_some() && before.as_ref() != Some(&self.me) {
+                    if std::mem::take(&mut self.share_interrupted) {
+                        out = out.event(Event::ResumeSharing);
+                    }
+                } else if !peer_has_it {
+                    self.share_interrupted = false;
+                }
                 if self.presenter.value.as_ref() == Some(&self.me) && !self.sharing {
                     // Stale state from before a restart: we are not sharing anything.
                     let stamp = self.presenter.set_local(None, &self.me);
@@ -344,8 +398,12 @@ impl Session {
                 self.annotations.merge(&items);
                 Out::default().event(Event::AnnotationsChanged)
             }
-            Msg::Recording { active } => {
-                self.peer_recording = active;
+            Msg::Recording { active, elapsed_ms } => {
+                self.peer_recording_since = active.then(|| {
+                    let now = Instant::now();
+                    now.checked_sub(Duration::from_millis(elapsed_ms))
+                        .unwrap_or(now)
+                });
                 Out::default().event(Event::RecordingChanged)
             }
             Msg::MediaReceived { ok } => {
@@ -500,6 +558,46 @@ mod tests {
     }
 
     #[test]
+    fn my_share_comes_back_after_peer_stops() {
+        let mut p = Pair::new();
+        let o = p.a.start_presenting();
+        p.deliver(o.send, vec![]);
+        // B takes over, then stops: A shares again.
+        let o = p.b.start_presenting();
+        let ev = p.a.handle(o.send[0].clone());
+        assert!(!ev.has(Event::ResumeSharing));
+        let o = p.b.stop_presenting();
+        let ev = p.a.handle(o.send[0].clone());
+        assert!(ev.has(Event::ResumeSharing));
+
+        // Only once: B shares and stops again, A was not sharing.
+        let o = p.b.start_presenting();
+        p.a.handle(o.send[0].clone());
+        let o = p.b.stop_presenting();
+        assert!(!p.a.handle(o.send[0].clone()).has(Event::ResumeSharing));
+    }
+
+    #[test]
+    fn no_resume_if_i_was_not_sharing_or_moved_on() {
+        let mut p = Pair::new();
+        // A was not sharing when B started.
+        let o = p.b.start_presenting();
+        p.a.handle(o.send[0].clone());
+        let o = p.b.stop_presenting();
+        assert!(!p.a.handle(o.send[0].clone()).has(Event::ResumeSharing));
+
+        // A shared, B took over, A then clicked "Stop sharing" (a no-op for
+        // the presenter, but it says "don't bring mine back").
+        let o = p.a.start_presenting();
+        p.deliver(o.send, vec![]);
+        let o = p.b.start_presenting();
+        p.a.handle(o.send[0].clone());
+        p.a.stop_presenting();
+        let o = p.b.stop_presenting();
+        assert!(!p.a.handle(o.send[0].clone()).has(Event::ResumeSharing));
+    }
+
+    #[test]
     fn stopping_when_not_presenter_is_noop() {
         let mut p = Pair::new();
         let out = p.b.start_presenting();
@@ -626,13 +724,36 @@ mod tests {
         let mut p = Pair::new();
         let o = p.a.set_recording(true);
         p.deliver(o.send, vec![]);
-        assert!(p.b.peer_recording && p.a.recording);
+        assert!(p.b.peer_is_recording() && p.a.is_recording());
         let o = p.b.disconnected();
-        assert!(o.has(Event::RecordingChanged) && !p.b.peer_recording);
+        assert!(o.has(Event::RecordingChanged) && !p.b.peer_is_recording());
         // A reconnecting while recording tells B again.
         let oa = p.a.connected(peer("b"));
         p.b.connected(peer("a"));
         p.deliver(oa.send, vec![]);
-        assert!(p.b.peer_recording);
+        assert!(p.b.peer_is_recording());
+    }
+
+    #[test]
+    fn recording_time_is_shared() {
+        let mut p = Pair::new();
+        assert!(p.a.recording_timers().is_empty());
+        p.a.set_recording(true);
+        // B learns about it later (e.g. reconnect) with the elapsed time.
+        p.b.handle(Msg::Recording {
+            active: true,
+            elapsed_ms: 125_000,
+        });
+        let r = p.b.recording_timers();
+        assert_eq!(r.len(), 1);
+        assert!(r[0].1 >= Duration::from_secs(125) && r[0].1 < Duration::from_secs(130));
+        assert_eq!(p.a.recording_timers()[0].0, "A");
+        p.b.handle(Msg::Recording {
+            active: false,
+            elapsed_ms: 0,
+        });
+        assert!(p.b.recording_timers().is_empty());
+        p.a.set_recording(false);
+        assert!(p.a.recording_timers().is_empty());
     }
 }

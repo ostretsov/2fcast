@@ -21,7 +21,8 @@ video podcast on Ubuntu:
   The dashed blue mark on your level meter shows the threshold.
 * **Level meters.** The bottom bar shows both voices on a −60…0 dB scale (bar =
   loudness, thin mark = peak). Keep speech in the green; yellow is loud, red
-  (above −3 dB) will distort. A muted mic reads "silent".
+  (above −3 dB) will distort. A muted mic reads "silent". Your own name is the
+  bold one; hover over the meters to see which config file sets it.
 * **Webcams.** Both cameras are shown and recorded.
 * **Shared space.** Either of you clicks **Share…** and picks a window (a
   browser with a YouTube video, a presentation, …) or the entire screen. The
@@ -29,6 +30,8 @@ video podcast on Ubuntu:
   latest one wins: if you share while recording and your brother then shares
   his window, his window replaces yours in the shared space (and in the
   recording, which simply continues) and both of you can draw on it.
+  When he stops sharing, your window comes back (unless you closed it or
+  clicked **Stop sharing** in the meantime).
   The sound of the shared app (e.g. the YouTube video) is sent along too
   (`share_sound = false` turns that off).
   A shared window that is bigger than the shared-space tile is shrunk (never
@@ -51,12 +54,16 @@ video podcast on Ubuntu:
   Drawings are cleared when someone else starts sharing.
 * **Mute** with the **Mic** button or **Ctrl+M**. While your mic is muted a big crossed-out microphone covers the
   shared space in *your* window (it is not recorded). Click it to unmute.
+* **Self-view.** If seeing yourself distracts you, click **Self-view on** to switch it to
+  **Self-view off**: your camera is covered by a crossed-out camera in *your* window only. Your
+  partner still sees you and the recording still includes you. The choice is remembered.
 * **Layout.** Pick a preset under **Layout** or press **Ctrl+1** … **Ctrl+4**
   (screen + cameras right, screen + small cameras, cameras only, screen only),
   or use **Arrange** (next to **Layout**) to drag tiles and scroll to resize them. The layout is
   the same on both machines and is remembered between sessions.
 * **Record.** Either of you presses **Record** (pressing it again asks before
-  it stops). That machine writes exactly what
+  it stops). The button always shows the free space where recordings go
+  ("● Record · 41.3 GB free"), so you know before you start. That machine writes exactly what
   the preview shows (1920×1080, 30 fps, H.264) to `~/Videos/2fcast/*.mkv`, with
   four Opus audio tracks (128 kbit/s each), in this order:
   1. `Mix` — everything together; players and YouTube use this one,
@@ -68,15 +75,20 @@ video podcast on Ubuntu:
   editor. Titles keep only `A–Z a–z 0–9 _ + - . / :` (spaces become `_`, a
   GStreamer 1.20 limitation); a name with none of these becomes `Me`/`Partner`.
   The partner's voice is recorded as it arrives over the LAN (128 kbit/s Opus).
-  The other side sees "● … is recording". MKV stays playable even if the app
-  or the computer crashes mid-recording.
+  Both machines show who is recording and for how long next to the level
+  meters ("● Artem recording 01:05", hours:minutes; one line each if both
+  record). The recording machine's line also shows the file size
+  ("· 1.2 GB"). MKV stays playable even if
+  the app or the computer crashes mid-recording.
+* **Folders.** The right of the bottom bar shows where recordings go and where
+  the log is; click either path to open its folder.
 
 ## Install
 
 On each machine (Ubuntu 22.04 or newer, X11 session):
 
 ```sh
-sudo apt install ./2fcast_0.4.1_amd64.deb
+sudo apt install ./2fcast_0.5.0_amd64.deb
 ```
 
 The package is self-contained, like Discord: it brings its own GTK 4,
@@ -91,7 +103,7 @@ Build the package yourself (on the *oldest* Ubuntu it should run on):
 ```sh
 curl https://sh.rustup.rs -sSf | sh       # Rust, once
 make deps                                 # build dependencies, once (sudo)
-make deb                                  # -> target/2fcast_0.4.1_amd64.deb
+make deb                                  # -> target/2fcast_0.5.0_amd64.deb
 make deb V=0.3.1                          # bump the version (crates, Cargo.lock, README), then build
 make docker-test                          # install it in clean Ubuntu containers + self-test
 ```
@@ -112,7 +124,8 @@ instances on one machine — your webcam as "Artem", a test camera as
 1. Both start **2fcast**. The title shows "Connected to …" within a few seconds.
 2. Talk. Share windows, draw, arrange the layout.
 3. When ready, one of you presses **● Record**; press **■ Stop** at the end.
-   The status line at the bottom shows where the file was saved.
+   The status line at the bottom shows where the file was saved; click the
+   **Recordings** path to open the folder.
 
 ## Settings
 
@@ -137,6 +150,11 @@ instances on one machine — your webcam as "Artem", a test camera as
 | `record_bitrate_kbps` | `6000` | video bitrate of the recording (~2.7 GB/hour max) |
 | `record_preset` | `"veryfast"` | x264 speed: `superfast` uses less CPU, `faster` gives better quality |
 
+Button choices that should survive a restart (currently **Self-view**) are
+kept in `ui.json` next to it, so clicking buttons never touches your
+hand-edited `config.toml`.
+The layout is kept in `layout.json`.
+
 Run a second instance on one machine (for trying things out):
 `2fcast --config-dir /tmp/other` with a different `base_port` in its config.
 
@@ -155,6 +173,7 @@ S=/run/user/$UID/2fcast.sock
 2fcast --ctl $S '{"cmd":"stop_sharing"}'
 2fcast --ctl $S '{"cmd":"record","on":true}'             # and false to stop
 2fcast --ctl $S '{"cmd":"mute","on":true}'
+2fcast --ctl $S '{"cmd":"hide_self_view","on":true}'     # my camera hidden on my screen only
 2fcast --ctl $S '{"cmd":"preset","name":"cams_only"}'    # screen_cams_right, screen_cams_overlay, cams_only, screen_only
 2fcast --ctl $S '{"cmd":"draw","points":[[0.1,0.5],[0.9,0.5]]}'
 2fcast --ctl $S '{"cmd":"text","x":0.1,"y":0.2,"text":"hello"}'
@@ -164,6 +183,11 @@ S=/run/user/$UID/2fcast.sock
 2fcast --ctl $S '{"cmd":"undo"}'
 2fcast --ctl $S '{"cmd":"clear"}'
 ```
+
+The state includes, among others, `recording` / `peer_recording`,
+`recording_secs` / `peer_recording_secs` (how long each side has been
+recording), `recording_file_bytes` (this machine's recording),
+`disk_free_bytes` (where recordings go), `muted` and `self_view_hidden`.
 
 Useful for hotkeys (e.g. a keyboard shortcut that starts recording) and for
 testing the real app without simulating mouse clicks.
@@ -182,7 +206,7 @@ testing the real app without simulating mouse clicks.
   receives nothing from you (firewall on theirs), or a stream arrives but
   cannot be decoded.
 * **Logs:** every run writes `~/.cache/2fcast/2fcast.log` (the previous run:
-  `2fcast.prev.log`): versions, settings, connection, sharing, recording,
+  `2fcast.prev.log`; click the **Log** path in the bottom bar to open the folder): versions, settings, connection, sharing, recording,
   errors, and per incoming stream when the first packet and the first decoded
   frame arrived. Send both machines' logs when reporting a problem.
   `TWOFCAST_DEBUG=1 2fcast` also prints it; `GST_DEBUG=2` adds GStreamer's own.
@@ -230,7 +254,8 @@ cargo test -p twofcast-core -- --ignored           # + real mDNS discovery
 ```
 
 * `crates/core`: protocol, session convergence (simultaneous presenting,
-  restarts, reconnects), layout, annotation rendering, networking over
+  restarts, reconnects, getting your share back after the partner's ends,
+  recording times), layout, annotation rendering, networking over
   localhost (connect, disconnect detection, reconnect, self/duplicate
   rejection), pactl parsing (with real PipeWire output), configuration, level meters,
   microphone channel detection, the noise gate, the control protocol.
