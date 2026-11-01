@@ -15,6 +15,7 @@ use twofcast_core::annotations::{
 use twofcast_core::config::{self, Config};
 use twofcast_core::control;
 use twofcast_core::deps;
+use twofcast_core::idle_image;
 use twofcast_core::layout::{CANVAS_H, CANVAS_W, Fit, Layout, PadParams, Preset, Rect, TileId};
 use twofcast_core::levels;
 use twofcast_core::mic_channel::Mode as MicMode;
@@ -528,6 +529,19 @@ fn build(
             }
         });
     }
+    // Asks the presenter for a keyframe of their screen when one is needed,
+    // and shows their screen once a complete picture arrived.
+    let a = app.clone();
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        if let Ok(app) = a.try_borrow() {
+            if app.session.peer.is_some() && app.media.screen_keyframe_due() {
+                debug("asking the partner for a keyframe of their screen");
+                app.net.send(&Msg::ScreenKeyframe);
+            }
+            app.media.refresh_pads();
+        }
+        glib::ControlFlow::Continue
+    });
     let a = app.clone();
     glib::timeout_add_local(Duration::from_millis(1000), move || {
         if let Ok(mut app) = a.try_borrow_mut() {
@@ -1028,6 +1042,43 @@ fn connect_signals(app: &Shared) {
     let hint = gtk::Label::new(Some("Use the Arrange tool to drag and resize tiles."));
     hint.add_css_class("dim-label");
     layout_box.append(&hint);
+    layout_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    let pick = gtk::Button::with_label("Picture while nobody shares…");
+    pick.set_tooltip_text(Some(
+        "Shown in the shared space (and recorded) instead of black while nobody shares",
+    ));
+    let a = app.clone();
+    pick.connect_clicked(move |b| {
+        if let Some(p) = b.ancestor(gtk::Popover::static_type()) {
+            p.downcast::<gtk::Popover>().unwrap().popdown();
+        }
+        choose_idle_image(&a);
+    });
+    layout_box.append(&pick);
+    let none = gtk::Button::with_label("No picture (black)");
+    none.set_widget_name("idle-none");
+    let a = app.clone();
+    none.connect_clicked(move |_| {
+        with(&a, |app| {
+            let _ = app.set_idle_image(None);
+        })
+    });
+    layout_box.append(&none);
+    let check = gtk::Label::new(None);
+    check.set_widget_name("idle-check");
+    check.set_wrap(true);
+    check.set_max_width_chars(40);
+    check.set_xalign(0.0);
+    check.add_css_class("dim-label");
+    layout_box.append(&check);
+    let saved = app.borrow().prefs.idle_image.clone();
+    if let Some(path) = saved {
+        with(app, move |app| {
+            if let Err(e) = app.set_idle_image(Some(path)) {
+                app.ui.error.set_text(&e);
+            }
+        });
+    }
 
     // --- preview & drawing ---
     let a = app.clone();
@@ -1212,6 +1263,9 @@ impl App {
         if out.has(Event::ResumeSharing) {
             self.resume_sharing();
         }
+        if out.has(Event::ScreenKeyframeRequested) {
+            self.media.force_screen_keyframe();
+        }
     }
 
     /// The partner stopped sharing after taking over from me: share again
@@ -1299,6 +1353,15 @@ impl App {
     }
 
     fn refresh_ui(&self) {
+        if let Some(l) = find::<gtk::Label>(&self.ui.window, "idle-check") {
+            let text = self.idle_image_check();
+            if l.text() != text {
+                l.set_text(&text);
+            }
+        }
+        if let Some(b) = find::<gtk::Button>(&self.ui.window, "idle-none") {
+            b.set_sensitive(self.prefs.idle_image.is_some());
+        }
         let s = &self.session;
         let mut status = match &s.peer {
             None => "Looking for your partner on the local network…".to_string(),
@@ -1623,6 +1686,7 @@ impl App {
                 self.set_self_view_hidden(on);
                 Ok(())
             }
+            C::IdleImage { path } => self.set_idle_image(path.map(PathBuf::from)),
             C::Preset { name } => match control::parse_preset(&name) {
                 None => Err(format!("unknown preset {name}")),
                 Some(p) => {
@@ -1741,6 +1805,12 @@ impl App {
             disk_free_bytes: self.disk_free_bytes(),
             muted: self.media.is_mic_muted(),
             self_view_hidden: self.prefs.hide_self_view,
+            idle_image: self
+                .prefs
+                .idle_image
+                .as_ref()
+                .map(|p| p.display().to_string()),
+            idle_image_check: self.idle_image_check(),
             mic_channel: self
                 .media
                 .has_mic()
@@ -2133,6 +2203,46 @@ impl App {
         self.ui.area.queue_draw();
     }
 
+    /// Sets (and remembers) the picture shown while nobody shares; `None`:
+    /// black.  On success the status line tells how sharp it will look.
+    fn set_idle_image(&mut self, path: Option<PathBuf>) -> Result<(), String> {
+        if let Err(e) = self.media.set_idle_image(path.as_deref()) {
+            let e = format!("{e:#}");
+            self.ui.error.set_text(&e);
+            return Err(e);
+        }
+        if self.prefs.idle_image != path {
+            self.prefs.idle_image = path;
+            if let Err(e) = config::save_ui_prefs(&self.cfg_dir, &self.prefs) {
+                debug(&format!("cannot save ui prefs: {e:#}"));
+            }
+        }
+        let check = self.idle_image_check();
+        self.ui.error.set_text(&if check.is_empty() {
+            String::new()
+        } else {
+            format!("Picture while nobody shares: {check}")
+        });
+        self.refresh_ui();
+        Ok(())
+    }
+
+    /// How sharp the idle picture looks in the shared space of the current
+    /// layout (empty without a picture).
+    fn idle_image_check(&self) -> String {
+        let Some(size) = self.media.idle_image_size() else {
+            return String::new();
+        };
+        let screen = &self.session.layout().screen;
+        if !screen.visible {
+            return format!(
+                "{}×{}: the shared space is hidden in this layout.",
+                size.0, size.1
+            );
+        }
+        idle_image::check(size, idle_image::tile_size(&screen.rect)).message(size)
+    }
+
     /// Hides or shows my own camera on my screen only (button, control API).
     fn set_self_view_hidden(&mut self, on: bool) {
         if self.prefs.hide_self_view != on {
@@ -2401,3 +2511,45 @@ impl App {
         }
     }
 }
+
+/// Lets the user pick the picture shown while nobody shares.
+fn choose_idle_image(app: &Shared) {
+    let window = app.borrow().ui.window.clone();
+    let dialog = gtk::FileChooserNative::new(
+        Some("Picture while nobody shares"),
+        Some(&window),
+        gtk::FileChooserAction::Open,
+        Some("Use"),
+        Some("Cancel"),
+    );
+    let filter = gtk::FileFilter::new();
+    filter.set_name(Some("Pictures"));
+    filter.add_pixbuf_formats();
+    dialog.add_filter(&filter);
+    if let Some(dir) = app
+        .borrow()
+        .prefs
+        .idle_image
+        .as_ref()
+        .and_then(|p| p.parent())
+    {
+        let _ = dialog.set_current_folder(Some(&gio::File::for_path(dir)));
+    }
+    let a = app.clone();
+    dialog.connect_response(move |d, response| {
+        if response == gtk::ResponseType::Accept
+            && let Some(path) = d.file().and_then(|f| f.path())
+        {
+            with(&a, move |app| {
+                let _ = app.set_idle_image(Some(path));
+            });
+        }
+        d.destroy();
+        OPEN_DIALOG.with(|o| o.borrow_mut().take());
+    });
+    dialog.show();
+    // A native dialog disappears when its last reference is dropped.
+    OPEN_DIALOG.with(|o| *o.borrow_mut() = Some(dialog));
+}
+
+thread_local!(static OPEN_DIALOG: RefCell<Option<gtk::FileChooserNative>> = const { RefCell::new(None) });

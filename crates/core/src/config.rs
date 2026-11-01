@@ -147,6 +147,8 @@ pub fn save_layout(dir: &Path, layout: &Layout) -> anyhow::Result<()> {
 pub struct UiPrefs {
     /// My own camera is covered on my screen (still sent and recorded).
     pub hide_self_view: bool,
+    /// Picture shown in the shared space while nobody shares.
+    pub idle_image: Option<PathBuf>,
 }
 
 pub fn load_ui_prefs(dir: &Path) -> UiPrefs {
@@ -199,9 +201,19 @@ mod tests {
         assert_eq!(load_ui_prefs(dir.path()), UiPrefs::default());
         let p = UiPrefs {
             hide_self_view: true,
+            idle_image: Some("/home/me/Pictures/logo 1.png".into()),
         };
         save_ui_prefs(dir.path(), &p).unwrap();
         assert_eq!(load_ui_prefs(dir.path()), p);
+        // Older files without the picture still load.
+        std::fs::write(dir.path().join("ui.json"), r#"{"hide_self_view":true}"#).unwrap();
+        assert_eq!(
+            load_ui_prefs(dir.path()),
+            UiPrefs {
+                hide_self_view: true,
+                idle_image: None
+            }
+        );
         std::fs::write(dir.path().join("ui.json"), "garbage").unwrap();
         assert_eq!(load_ui_prefs(dir.path()), UiPrefs::default());
     }

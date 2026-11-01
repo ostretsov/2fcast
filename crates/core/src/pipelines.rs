@@ -134,22 +134,42 @@ impl Channels {
 const INTERAUDIO_SRC_PROPS: &str =
     "buffer-time=80000000 latency-time=20000000 period-time=10000000";
 
-/// H.264 for the LAN.  A keyframe every second, so a receiver that starts
-/// late (the partner takes over sharing, or restarts the app) has a complete
-/// picture within a second.  The VBV buffer (100 ms) caps every frame at about
+/// H.264 for the LAN, encoder named `encoder`, a keyframe at least every
+/// `keyframe_s` seconds.  The VBV buffer (100 ms) caps every frame at about
 /// a tenth of a second of bitrate: an uncapped 1080p keyframe is a burst of
 /// hundreds of kilobytes, more than the default UDP receive buffer (~200 KB),
 /// and the lost packets show up as green blocks.  SPS/PPS are repeated every
 /// second (`config-interval=1`); `-1` (before every keyframe) makes OpenH264
 /// (the decoder of the self-contained package) decode nothing at all.
-fn h264_sender(valve: &str, net: &str, bitrate_kbps: u32) -> String {
+fn h264_sender(
+    valve: &str,
+    encoder: &str,
+    net: &str,
+    bitrate_kbps: u32,
+    keyframe_s: u32,
+) -> String {
     format!(
         "queue leaky=downstream max-size-buffers=2 ! valve name={valve} drop=true drop-mode=forward-sticky-events ! \
-         x264enc tune=zerolatency speed-preset=ultrafast bitrate={bitrate_kbps} key-int-max={FPS} \
+         x264enc name={encoder} tune=zerolatency speed-preset=ultrafast bitrate={bitrate_kbps} key-int-max={key_int} \
          vbv-buf-capacity=100 ! \
-         rtph264pay config-interval=1 pt={VIDEO_PT} ! multiudpsink name={net} sync=false async=false"
+         rtph264pay config-interval=1 pt={VIDEO_PT} ! multiudpsink name={net} sync=false async=false",
+        key_int = FPS * keyframe_s,
     )
 }
+
+/// The camera has a keyframe every second, so a receiver that starts late
+/// (or lost packets) has a complete picture within a second.
+pub const CAMERA_KEYFRAME_S: u32 = 1;
+/// The shared screen gets keyframes on request ([`crate::keyframe`]): on
+/// screen content a capped keyframe is visibly blurrier than the frames
+/// before it, so regular ones make the picture pulse.  This is only a
+/// fallback in case requests get lost.
+pub const SCREEN_KEYFRAME_S: u32 = 60;
+/// Name of the screen's LAN encoder (receives the keyframe requests).
+pub const SCREEN_ENCODER: &str = "enc_screen";
+/// Names of the elements in a receive pipeline's video branch.
+pub const VIDEO_DEPAY: &str = "vdepay";
+pub const VIDEO_PARSE: &str = "vparse";
 
 fn opus_sender(valve: &str, net: &str, bitrate: u32) -> String {
     format!(
@@ -196,7 +216,7 @@ pub fn camera(ch: &Channels, src: &CamSource) -> String {
          tcam. ! {send}",
         caps = cam_caps(),
         local = ch.get("cam_local"),
-        send = h264_sender("valve_cam", "net_cam", 2500),
+        send = h264_sender("valve_cam", "enc_cam", "net_cam", 2500, CAMERA_KEYFRAME_S),
     )
 }
 
@@ -262,7 +282,13 @@ pub fn screen(ch: &Channels, src: &ScreenSource, audio_source: Option<&str>) -> 
          tscreen. ! {send}",
         caps = screen_caps(),
         local = ch.get("screen_local"),
-        send = h264_sender("valve_screen", "net_screen", 8000),
+        send = h264_sender(
+            "valve_screen",
+            SCREEN_ENCODER,
+            "net_screen",
+            8000,
+            SCREEN_KEYFRAME_S
+        ),
     );
     if let Some(a) = audio_source {
         let src = if a == "test" {
@@ -318,7 +344,7 @@ fn receive_pair(
     };
     format!(
         "udpsrc port={vport} buffer-size=4194304 caps=\"application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={VIDEO_PT}\" ! \
-         rtpjitterbuffer latency=50 drop-on-latency=true ! rtph264depay ! h264parse ! {decoder} ! \
+         rtpjitterbuffer latency=50 drop-on-latency=true ! rtph264depay name={VIDEO_DEPAY} ! h264parse name={VIDEO_PARSE} ! {decoder} ! \
          videoconvert ! videoscale add-borders=true ! videorate ! {vcaps} ! \
          queue leaky=downstream max-size-buffers=2 ! intervideosink sync=false async=false channel={vchannel} \
          udpsrc port={aport} caps=\"application/x-rtp,media=audio,clock-rate=48000,encoding-name=OPUS,payload={AUDIO_PT}\" ! \
@@ -379,6 +405,11 @@ pub fn receive_screen(ch: &Channels, ports: &Ports, playback: bool, decoder: &st
 
 /// Names of the queues feeding the compositor, in pad order.
 pub const PROGRAM_INPUTS: [&str; 4] = ["screen_local", "screen_remote", "cam_local", "cam_remote"];
+/// Channel and compositor queue of the picture shown while nobody shares.
+pub const IDLE_INPUT: &str = "idle";
+/// How long an `intervideosrc` repeats the last picture: the idle picture
+/// is sent once and must never time out (to black).
+const FOREVER_NS: u64 = 100 * 365 * 24 * 3600 * 1_000_000_000;
 
 /// Composes the final picture.  `overlay` (cairooverlay) draws annotations,
 /// `preview` (appsink) feeds the UI, the result goes to channel `program`.
@@ -409,7 +440,23 @@ pub fn program(ch: &Channels) -> String {
             ch.get(input)
         );
     }
+    // Any size: it arrives at exactly the size of its pad, so the compositor
+    // does not scale it (see `crate::idle_image`).
+    s += &format!(
+        " intervideosrc channel={} timeout={FOREVER_NS} ! video/x-raw,format=BGRx,framerate={FPS}/1 ! \
+         queue name=q_{IDLE_INPUT} max-size-buffers=2 leaky=downstream ! comp.",
+        ch.get(IDLE_INPUT)
+    );
     s
+}
+
+/// Hands the idle picture (pushed by the app into the `appsrc` named "src",
+/// one frame per change) to the program pipeline.
+pub fn idle_picture(ch: &Channels) -> String {
+    format!(
+        "appsrc name=src is-live=true format=time do-timestamp=true ! intervideosink sync=false async=false channel={}",
+        ch.get(IDLE_INPUT)
+    )
 }
 
 pub const RECORD_AUDIO_INPUTS: [&str; 4] =
@@ -537,6 +584,7 @@ mod tests {
             receive(&ch(), &Ports::from_base(1000), true, "avdec_h264"),
             receive_screen(&ch(), &Ports::from_base(1000), true, "avdec_h264"),
             program(&ch()),
+            idle_picture(&ch()),
         ]
         .join(" ");
         let sinks = all.matches("intervideosink").count() + all.matches("interaudiosink").count();
@@ -627,6 +675,19 @@ mod tests {
     }
 
     #[test]
+    fn idle_picture_reaches_the_compositor_unscaled_and_never_times_out() {
+        let s = program(&ch());
+        let idle = &s[s.find("channel=t1-idle").expect("idle input")..];
+        let idle = &idle[..idle.find("comp.").unwrap()];
+        assert!(idle.contains(&format!("timeout={FOREVER_NS}")), "{idle}");
+        assert!(
+            !idle.contains("width="),
+            "no fixed size: no second scaling: {idle}"
+        );
+        assert!(idle_picture(&ch()).contains("channel=t1-idle"));
+    }
+
+    #[test]
     fn record_mixes_all_audio() {
         let s = record(&ch(), 6000, "rm -rf");
         // Mix, my voice, partner's voice, shared sound - in this order.
@@ -676,10 +737,13 @@ mod tests {
     #[test]
     fn lan_video_avoids_keyframe_bursts() {
         let s = screen(&ch(), &ScreenSource::Screen, None);
+        assert!(s.contains("vbv-buf-capacity=100"), "{s}");
         assert!(
-            s.contains("key-int-max=30 ") && s.contains("vbv-buf-capacity=100"),
-            "{s}"
+            s.contains(&format!("name={SCREEN_ENCODER} ")) && s.contains("key-int-max=1800 "),
+            "screen keyframes come on request, not every second: {s}"
         );
+        let c = camera(&ch(), &CamSource::Test(0));
+        assert!(c.contains("key-int-max=30 "), "{c}");
         assert!(
             s.contains("rtph264pay config-interval=1 "),
             "OpenH264 cannot decode config-interval=-1"
@@ -722,7 +786,9 @@ mod tests {
     #[test]
     fn decoder_is_configurable() {
         let s = receive(&ch(), &Ports::from_base(1), false, "openh264dec");
-        assert!(s.contains("h264parse ! openh264dec ! ") && !s.contains("avdec_h264"));
+        assert!(
+            s.contains(&format!("{VIDEO_PARSE} ! openh264dec ! ")) && !s.contains("avdec_h264")
+        );
     }
 
     #[test]

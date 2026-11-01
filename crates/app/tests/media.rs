@@ -112,9 +112,25 @@ fn near(p: [u8; 3], rgb: u32) -> bool {
 
 /// Waits until `check` holds for the latest preview frame.
 fn wait_for(m: &Media, what: &str, check: impl Fn(&Frame) -> bool) {
+    wait_frame(m, what, check, || {});
+}
+
+/// Waits until `check` holds on `receiver`, which receives `sender`'s screen;
+/// keyframe requests are passed on as the control connection would.
+fn wait_for_shared(sender: &Media, receiver: &Media, what: &str, check: impl Fn(&Frame) -> bool) {
+    wait_frame(receiver, what, check, || {
+        if receiver.screen_keyframe_due() {
+            sender.force_screen_keyframe();
+        }
+        receiver.refresh_pads();
+    });
+}
+
+fn wait_frame(m: &Media, what: &str, check: impl Fn(&Frame) -> bool, tick: impl Fn()) {
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut last = None;
     while Instant::now() < deadline {
+        tick();
         if let Some(f) = m.latest_frame() {
             if check(&f) {
                 return;
@@ -216,7 +232,7 @@ fn shared_screen_reaches_peer_and_annotations_are_drawn() {
     b.apply_pads(&layout.pads(&me_b, Some(&me_a), Some(&me_a)));
     b.set_receive_screen(true);
     wait_for(&a, "own shared screen", smpte_visible);
-    wait_for(&b, "A's shared screen on B", smpte_visible);
+    wait_for_shared(&a, &b, "A's shared screen on B", smpte_visible);
 
     // A red line across the middle of the shared space.
     let mut ann = Annotations::default();
@@ -475,7 +491,117 @@ fn receiver_that_starts_late_still_gets_the_picture() {
     std::thread::sleep(Duration::from_secs(3));
     b.apply_pads(&layout.pads(&me_b, Some(&me_a), Some(&me_a)));
     b.set_receive_screen(true);
-    wait_for(&b, "late receiver decodes", smpte_visible);
+    wait_for_shared(&a, &b, "late receiver decodes", smpte_visible);
+}
+
+#[test]
+fn partner_screen_appears_only_with_a_complete_picture() {
+    // A's screen stream has no regular keyframes; B starts receiving after
+    // A's first one.  Until B's request is answered, frames arrive but none
+    // is complete: B's shared space stays black (no grey or broken picture).
+    let mut a = machine("kf-a-", 47760, A_COLOR);
+    let mut b = machine("kf-b-", 47780, B_COLOR);
+    let layout = Layout::preset(Preset::ScreenOnly, &ids());
+    let (me_a, me_b) = ("a".to_string(), "b".to_string());
+    a.set_peer(Some((LOCALHOST, Ports::from_base(47780))));
+    b.set_peer(Some((LOCALHOST, Ports::from_base(47760))));
+    a.start_screen(&ScreenSource::Test, None).unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    b.apply_pads(&layout.pads(&me_b, Some(&me_a), Some(&me_a)));
+    b.set_receive_screen(true);
+    assert!(b.screen_keyframe_due(), "asks for a keyframe right away");
+    assert!(!b.screen_keyframe_due(), "but not again at once");
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(2) {
+        b.refresh_pads();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let f = b.latest_frame().expect("preview runs");
+    assert!(
+        near(pixel(&f, 100.0, 200.0), 0x000000),
+        "nothing shown before a keyframe: {:?}",
+        pixel(&f, 100.0, 200.0)
+    );
+    wait_for_shared(&a, &b, "picture after the keyframe", smpte_visible);
+    assert!(!b.screen_keyframe_due(), "no more requests once it arrived");
+}
+
+/// A PNG of one color.
+fn png(dir: &std::path::Path, w: i32, h: i32, rgb: u32) -> std::path::PathBuf {
+    use gtk::gdk_pixbuf::{Colorspace, Pixbuf};
+    let p = Pixbuf::new(Colorspace::Rgb, false, 8, w, h).unwrap();
+    p.fill(rgb << 8 | 0xff);
+    let path = dir.join("idle.png");
+    p.savev(&path, "png", &[]).unwrap();
+    path
+}
+
+#[test]
+fn idle_picture_shows_while_nobody_shares() {
+    const IDLE: u32 = 0xc03080;
+    let mut a = machine("idle-a-", 47800, A_COLOR);
+    let mut b = machine("idle-b-", 47820, B_COLOR);
+    a.set_peer(Some((LOCALHOST, Ports::from_base(47820))));
+    b.set_peer(Some((LOCALHOST, Ports::from_base(47800))));
+    let layout = Layout::preset(Preset::ScreenOnly, &ids());
+    let (me_a, me_b) = ("a".to_string(), "b".to_string());
+    let dir = tempfile::tempdir().unwrap();
+
+    assert!(
+        a.set_idle_image(Some(&dir.path().join("missing.png")))
+            .is_err()
+    );
+    let size = a
+        .set_idle_image(Some(&png(dir.path(), 1920, 1080, IDLE)))
+        .unwrap();
+    assert_eq!(size, Some((1920, 1080)));
+    a.apply_pads(&layout.pads(&me_a, Some(&me_b), None));
+    wait_for(&a, "idle picture", |f| near(pixel(f, 100.0, 200.0), IDLE));
+    assert!(
+        a.set_idle_image(Some(&dir.path().join("missing.png")))
+            .is_err()
+    );
+    assert_eq!(
+        a.idle_image_size(),
+        Some((1920, 1080)),
+        "a bad file keeps the picture"
+    );
+
+    // I share: my screen replaces it.
+    a.start_screen(&ScreenSource::Test, None).unwrap();
+    a.apply_pads(&layout.pads(&me_a, Some(&me_b), Some(&me_a)));
+    wait_for(&a, "own screen over the picture", smpte_visible);
+    a.stop_screen();
+
+    // The partner shares: the picture stays until their first complete
+    // picture arrives (no black gap), then theirs is shown.
+    b.start_screen(&ScreenSource::Test, None).unwrap();
+    std::thread::sleep(Duration::from_secs(1));
+    a.apply_pads(&layout.pads(&me_a, Some(&me_b), Some(&me_b)));
+    a.set_receive_screen(true);
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(1) {
+        a.refresh_pads();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let f = a.latest_frame().unwrap();
+    assert!(
+        near(pixel(&f, 100.0, 200.0), IDLE),
+        "{:?}",
+        pixel(&f, 100.0, 200.0)
+    );
+    wait_for_shared(&b, &a, "partner's screen", smpte_visible);
+
+    // Nobody shares again, then the picture is removed: black.
+    a.set_receive_screen(false);
+    a.apply_pads(&layout.pads(&me_a, Some(&me_b), None));
+    wait_for(&a, "idle picture again", |f| {
+        near(pixel(f, 100.0, 200.0), IDLE)
+    });
+    a.set_idle_image(None).unwrap();
+    wait_for(&a, "black without a picture", |f| {
+        near(pixel(f, 100.0, 200.0), 0x000000)
+    });
 }
 
 #[test]
@@ -502,7 +628,7 @@ fn partner_takes_over_sharing_while_we_record() {
     .unwrap();
     b.set_receive_screen(true);
     b.apply_pads(&layout.pads(&me_b, Some(&me_a), Some(&me_a)));
-    wait_for(&b, "B sees A's screen", smpte_visible);
+    wait_for_shared(&a, &b, "B sees A's screen", smpte_visible);
     // B takes over: B captures, A stops and receives.
     b.set_receive_screen(false);
     b.start_screen(&ScreenSource::Test, Some("test")).unwrap();
@@ -510,7 +636,7 @@ fn partner_takes_over_sharing_while_we_record() {
     a.set_receive_screen(true);
     a.apply_pads(&layout.pads(&me_a, Some(&me_b), Some(&me_b)));
     let start = Instant::now();
-    wait_for(&a, "A sees B's screen", smpte_visible);
+    wait_for_shared(&b, &a, "A sees B's screen", smpte_visible);
     let took = start.elapsed();
     assert!(
         took < Duration::from_secs(3),

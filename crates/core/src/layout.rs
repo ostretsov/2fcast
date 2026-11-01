@@ -305,6 +305,21 @@ pub struct Pads {
     pub screen_remote: PadParams,
     pub cam_local: PadParams,
     pub cam_remote: PadParams,
+    /// The picture shown in the shared space while nobody shares
+    /// ([`crate::idle_image`]).
+    pub idle: PadParams,
+}
+
+impl Pads {
+    /// These pads, with the partner's screen hidden unless `ready` (a
+    /// complete picture of it has arrived); the idle picture fills in.
+    pub fn show_remote_screen(mut self, ready: bool) -> Pads {
+        if !ready && self.screen_remote.alpha > 0.0 {
+            self.screen_remote.alpha = 0.0;
+            self.idle.alpha = 1.0;
+        }
+        self
+    }
 }
 
 fn pad(t: Option<&Tile>, shown: bool, zorder: u32) -> PadParams {
@@ -336,6 +351,7 @@ impl Layout {
             ),
             cam_local: pad(self.cams.get(me), true, z_me),
             cam_remote: pad(peer.and_then(|p| self.cams.get(p)), peer.is_some(), z_peer),
+            idle: pad(Some(&self.screen), presenter.is_none(), 0),
         }
     }
 }
@@ -487,6 +503,43 @@ mod tests {
         let r = Rect::new(100.0, 100.0, 200.0, 100.0);
         assert_eq!(r.normalize(200.0, 150.0), Pt { x: 0.5, y: 0.5 });
         assert!(r.contains(100.0, 100.0) && !r.contains(300.0, 150.0));
+    }
+
+    #[test]
+    fn remote_screen_waits_for_a_complete_picture() {
+        let ids = ["a".to_string(), "b".to_string()];
+        let l = Layout::preset(Preset::ScreenOnly, &ids);
+        let p = l.pads(&ids[0], Some(&ids[1]), Some(&ids[1]));
+        assert_eq!(p.screen_remote.alpha, 1.0);
+        assert_eq!(p.show_remote_screen(true), p);
+        assert_eq!(p.idle.alpha, 0.0, "no idle picture while someone shares");
+        let hidden = p.show_remote_screen(false);
+        assert_eq!(hidden.screen_remote.alpha, 0.0);
+        assert_eq!(hidden.idle.alpha, 1.0, "the idle picture covers the wait");
+        assert_eq!(hidden.cam_remote, p.cam_remote, "only the screen waits");
+        // My own share never waits.
+        let mine = l.pads(&ids[0], Some(&ids[1]), Some(&ids[0]));
+        assert_eq!(mine.show_remote_screen(false), mine);
+    }
+
+    #[test]
+    fn idle_picture_fills_the_shared_space_while_nobody_shares() {
+        let ids = ["a".to_string(), "b".to_string()];
+        let l = Layout::preset(Preset::ScreenCamsRight, &ids);
+        let p = l.pads(&ids[0], Some(&ids[1]), None);
+        assert_eq!(p.idle.alpha, 1.0);
+        assert_eq!(
+            (p.idle.x, p.idle.y, p.idle.w, p.idle.h),
+            (
+                p.screen_local.x,
+                p.screen_local.y,
+                p.screen_local.w,
+                p.screen_local.h
+            )
+        );
+        let mut hidden = l.clone();
+        hidden.set_visible(&TileId::Screen, false);
+        assert_eq!(hidden.pads(&ids[0], Some(&ids[1]), None).idle.alpha, 0.0);
     }
 
     #[test]

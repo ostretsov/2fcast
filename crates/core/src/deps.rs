@@ -12,6 +12,7 @@ pub const ELEMENTS: &[(&str, &str)] = &[
     ("opusenc", "gstreamer1.0-plugins-base"),
     ("opusdec", "gstreamer1.0-plugins-base"),
     ("appsink", "gstreamer1.0-plugins-base"),
+    ("appsrc", "gstreamer1.0-plugins-base"),
     ("videotestsrc", "gstreamer1.0-plugins-base"),
     ("v4l2src", "gstreamer1.0-plugins-good"),
     ("jpegdec", "gstreamer1.0-plugins-good"),

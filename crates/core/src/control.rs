@@ -11,6 +11,7 @@
 //! {"cmd":"record","on":true}
 //! {"cmd":"mute","on":true}
 //! {"cmd":"hide_self_view","on":true}  // my camera hidden on my screen only
+//! {"cmd":"idle_image","path":"/home/me/logo.png"}  // omit path: black again
 //! {"cmd":"preset","name":"cams_only"}
 //! {"cmd":"draw","points":[[0.1,0.1],[0.5,0.5]]}
 //! {"cmd":"text","x":0.1,"y":0.2,"text":"hello"}
@@ -51,6 +52,12 @@ pub enum Command {
     },
     Preset {
         name: String,
+    },
+    /// Picture shown in the shared space while nobody shares (remembered);
+    /// without `path`, none (black).
+    IdleImage {
+        #[serde(default)]
+        path: Option<String>,
     },
     /// A stroke on the shared space, points normalized to 0..1.
     Draw {
@@ -130,6 +137,11 @@ pub struct State {
     pub muted: bool,
     #[serde(default)]
     pub self_view_hidden: bool,
+    /// Picture shown while nobody shares, and how sharp it looks.
+    #[serde(default)]
+    pub idle_image: Option<String>,
+    #[serde(default)]
+    pub idle_image_check: String,
     /// "Both", "Left" or "Right": microphone input channel(s) in use.
     pub mic_channel: Option<String>,
     pub my_level_db: Option<f64>,
@@ -208,6 +220,16 @@ mod tests {
         assert_eq!(
             parse(r#"{"cmd":"hide_self_view","on":false}"#),
             Ok(Command::HideSelfView { on: false })
+        );
+        assert_eq!(
+            parse(r#"{"cmd":"idle_image","path":"/tmp/a b.png"}"#),
+            Ok(Command::IdleImage {
+                path: Some("/tmp/a b.png".into())
+            })
+        );
+        assert_eq!(
+            parse(r#"{"cmd":"idle_image"}"#),
+            Ok(Command::IdleImage { path: None })
         );
         assert_eq!(
             parse(r#"{"cmd":"draw","points":[[0.1,0.2],[0.3,0.4]]}"#),

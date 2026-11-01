@@ -43,6 +43,10 @@ pub enum Msg {
     /// Whether the sender receives our camera/voice (false: packets do not
     /// arrive, usually a firewall on the sender's side).
     MediaReceived { ok: bool },
+    /// The receiver of the shared screen needs a keyframe (it just started
+    /// receiving, or packets were lost); see [`crate::keyframe`].  Older
+    /// versions ignore it.
+    ScreenKeyframe,
     /// Keep-alive.
     Ping,
 }
@@ -109,6 +113,7 @@ mod tests {
             elapsed_ms: 61_000,
         });
         roundtrip(Msg::MediaReceived { ok: false });
+        roundtrip(Msg::ScreenKeyframe);
         roundtrip(Msg::Ping);
     }
 

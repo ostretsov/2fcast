@@ -84,6 +84,8 @@ pub enum Event {
     /// The peer stopped sharing after taking the shared space over from me:
     /// share again what I shared before.
     ResumeSharing,
+    /// The partner needs a keyframe of the screen I share.
+    ScreenKeyframeRequested,
 }
 
 /// Result of handling an input: messages to send to the peer and what changed.
@@ -410,7 +412,10 @@ impl Session {
                 self.peer_receives_us = Some(ok);
                 Out::default().event(Event::PeerChanged)
             }
-            Msg::Hello { .. } | Msg::Ping => Out::default(),
+            Msg::ScreenKeyframe if self.is_presenting() => {
+                Out::default().event(Event::ScreenKeyframeRequested)
+            }
+            Msg::ScreenKeyframe | Msg::Hello { .. } | Msg::Ping => Out::default(),
         }
     }
 }
@@ -706,6 +711,21 @@ mod tests {
         let ob = p.b.connected(peer("a"));
         p.deliver(oa.send, ob.send);
         assert_eq!(p.b.annotations.items().len(), 1);
+    }
+
+    #[test]
+    fn keyframe_requests_reach_only_the_presenter() {
+        let mut p = Pair::new();
+        let o = p.a.start_presenting();
+        p.deliver(o.send, vec![]);
+        assert!(
+            p.a.handle(Msg::ScreenKeyframe)
+                .has(Event::ScreenKeyframeRequested)
+        );
+        assert!(
+            !p.b.handle(Msg::ScreenKeyframe)
+                .has(Event::ScreenKeyframeRequested)
+        );
     }
 
     #[test]

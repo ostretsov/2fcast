@@ -61,6 +61,13 @@ video podcast on Ubuntu:
   (screen + cameras right, screen + small cameras, cameras only, screen only),
   or use **Arrange** (next to **Layout**) to drag tiles and scroll to resize them. The layout is
   the same on both machines and is remembered between sessions.
+* **Picture while nobody shares.** Under **Layout**, **Picture while nobody shares…** picks
+  an image (PNG, JPEG, SVG, …) shown — and recorded — in the shared space instead of black
+  (also while the partner's shared screen is still arriving). It is remembered. Below the button
+  you see how sharp it will look: it is scaled once to the shared space and placed 1:1, so the
+  sharpest picture has exactly the shared space's size (1440×810 in "screen + cameras right",
+  1920×1080 in "screen only"); a smaller one is enlarged and looks blurry. It is shown on your
+  machine (and in your recordings) only.
 * **Record.** Either of you presses **Record** (pressing it again asks before
   it stops). The button always shows the free space where recordings go
   ("● Record · 41.3 GB free"), so you know before you start. That machine writes exactly what
@@ -174,6 +181,7 @@ S=/run/user/$UID/2fcast.sock
 2fcast --ctl $S '{"cmd":"record","on":true}'             # and false to stop
 2fcast --ctl $S '{"cmd":"mute","on":true}'
 2fcast --ctl $S '{"cmd":"hide_self_view","on":true}'     # my camera hidden on my screen only
+2fcast --ctl $S '{"cmd":"idle_image","path":"/home/me/brb.png"}'  # omit path: black again
 2fcast --ctl $S '{"cmd":"preset","name":"cams_only"}'    # screen_cams_right, screen_cams_overlay, cams_only, screen_only
 2fcast --ctl $S '{"cmd":"draw","points":[[0.1,0.5],[0.9,0.5]]}'
 2fcast --ctl $S '{"cmd":"text","x":0.1,"y":0.2,"text":"hello"}'
@@ -235,8 +243,12 @@ elements: camera, microphone and shared screen are captured once and go both
 to the local compositor and (H.264/Opus over RTP/UDP) to the partner. The
 **program** pipeline composes the shared space and both cameras according to
 the layout, draws the annotations on top, and feeds both the preview and the
-recorder. LAN video uses x264 `ultrafast`/`zerolatency` with intra refresh
-(no big keyframe bursts); the recording uses x264 `veryfast` at 6 Mbit/s.
+recorder. LAN video uses x264 `ultrafast`/`zerolatency` with every frame capped
+at 100 ms of bitrate (no big bursts). The camera has a keyframe every second;
+the shared screen gets one only when the receiver asks (starting to receive,
+lost packets), because a capped keyframe of sharp screen content is visibly
+blurrier and regular ones made the shared screen pulse once a second. The
+recording uses x264 `veryfast` at 6 Mbit/s.
 
 The shared app's sound is moved into a private PulseAudio null sink whose
 monitor is captured (a loopback keeps it audible locally), so the partner's

@@ -13,6 +13,8 @@ use gst::prelude::*;
 use gtk::glib;
 use twofcast_core::annotations::Annotations;
 use twofcast_core::camera::{self, CamMode};
+use twofcast_core::idle_image;
+use twofcast_core::keyframe;
 use twofcast_core::layout::{PadParams, Pads, Rect};
 use twofcast_core::levels::Level;
 use twofcast_core::mic_channel::{Mode as MicMode, Pick, Picker};
@@ -124,6 +126,78 @@ fn log_first_buffer(pad: &gst::Pad, what: &'static str) {
         debug(what);
         gst::PadProbeReturn::Remove
     });
+}
+
+/// Keeps `requests` up to date for a receive pipeline: a keyframe is wanted
+/// from the start and whenever the depayloader notices lost packets (it then
+/// asks upstream for a keyframe, which never reaches the sender by itself);
+/// it is no longer wanted once one passes the parser.
+///
+/// `ready` is set once a picture decoded from a keyframe on leaves the
+/// receive pipeline.
+fn watch_keyframes(
+    pipe: &Pipe,
+    requests: &Arc<Mutex<keyframe::Requests>>,
+    ready: &Arc<AtomicBool>,
+) {
+    requests.lock().unwrap().want();
+    let keyframe_seen = Arc::new(AtomicBool::new(false));
+    if let Some(depay) = pipe.by_name(pipelines::VIDEO_DEPAY) {
+        if depay.find_property("request-keyframe").is_some() {
+            depay.set_property("request-keyframe", true);
+        }
+        if let Some(pad) = depay.static_pad("sink") {
+            let r = requests.clone();
+            pad.add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_, info| {
+                if let Some(gst::PadProbeData::Event(ev)) = &info.data
+                    && gst_video::UpstreamForceKeyUnitEvent::parse(ev).is_ok()
+                {
+                    let mut r = r.lock().unwrap();
+                    if !r.wanted() {
+                        debug("receive-screen: packets lost, need a keyframe");
+                    }
+                    r.want();
+                }
+                gst::PadProbeReturn::Ok
+            });
+        }
+    }
+    if let Some(pad) = pipe
+        .by_name(pipelines::VIDEO_PARSE)
+        .and_then(|e| e.static_pad("src"))
+    {
+        let r = requests.clone();
+        let seen = keyframe_seen.clone();
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(gst::PadProbeData::Buffer(b)) = &info.data
+                && !b.flags().contains(gst::BufferFlags::DELTA_UNIT)
+            {
+                seen.store(true, Ordering::Relaxed);
+                let mut r = r.lock().unwrap();
+                if r.wanted() {
+                    debug("receive-screen: keyframe arrived");
+                }
+                r.got();
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
+    let sink = pipe
+        .get()
+        .iterate_elements()
+        .into_iter()
+        .flatten()
+        .find(|e| e.factory().is_some_and(|f| f.name() == "intervideosink"));
+    if let Some(pad) = sink.and_then(|e| e.static_pad("sink")) {
+        let ready = ready.clone();
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            if keyframe_seen.load(Ordering::Relaxed) {
+                ready.store(true, Ordering::Relaxed);
+                return gst::PadProbeReturn::Remove;
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
 }
 
 /// Logs (debug) every 5 s how far the composed picture is behind the clock.
@@ -397,6 +471,71 @@ pub struct Media {
     peer_packets: Arc<Mutex<(Instant, Option<Instant>)>>,
     /// Per incoming stream: arriving and decoding (see `track_streams`).
     streams: StreamStats,
+    /// Whether to ask the presenter for a keyframe of their screen.
+    screen_keyframes: Arc<Mutex<keyframe::Requests>>,
+    /// A complete picture of the partner's screen arrived (decoded from a
+    /// keyframe on); until then their screen is not shown, so the program
+    /// never shows a stale or half-decoded picture when they start sharing.
+    screen_ready: Arc<AtomicBool>,
+    /// The pads last asked for, and whether they were applied with the
+    /// partner's screen ready.
+    pads: Mutex<Option<(Pads, bool)>>,
+    /// Picture shown in the shared space while nobody shares.
+    idle: Option<Idle>,
+}
+
+/// The idle picture: the original, and the size it was last sent at.
+struct Idle {
+    pipe: Pipe,
+    pixbuf: gtk::gdk_pixbuf::Pixbuf,
+    sent: std::cell::Cell<Option<(u32, u32)>>,
+}
+
+impl Idle {
+    fn size(&self) -> (u32, u32) {
+        (self.pixbuf.width() as u32, self.pixbuf.height() as u32)
+    }
+
+    /// Scales the picture once to fit `tile` (canvas pixels) and sends a
+    /// frame of exactly that size, so the compositor shows it 1:1.
+    fn send(&self, tile: (u32, u32)) {
+        if self.sent.get() == Some(tile) || tile.0 == 0 || tile.1 == 0 {
+            return;
+        }
+        let (w, h) = idle_image::fit(self.size(), tile);
+        let scaled = if (w, h) == self.size() {
+            Some(self.pixbuf.clone())
+        } else {
+            self.pixbuf
+                .scale_simple(w as i32, h as i32, gtk::gdk_pixbuf::InterpType::Hyper)
+        };
+        let Some(scaled) = scaled else { return };
+        let frame = idle_image::compose_bgrx(
+            &scaled.read_pixel_bytes(),
+            (w, h),
+            scaled.rowstride() as usize,
+            scaled.n_channels() as usize,
+            tile,
+        );
+        let Some(src) = self
+            .pipe
+            .by_name("src")
+            .and_then(|e| e.downcast::<gst_app::AppSrc>().ok())
+        else {
+            return;
+        };
+        let Ok(info) = gst_video::VideoInfo::builder(gst_video::VideoFormat::Bgrx, tile.0, tile.1)
+            .fps(gst::Fraction::new(pipelines::FPS as i32, 1))
+            .build()
+        else {
+            return;
+        };
+        src.set_caps(info.to_caps().ok().as_ref());
+        if src.push_buffer(gst::Buffer::from_mut_slice(frame)).is_ok() {
+            debug(&format!("idle picture sent at {}x{}", tile.0, tile.1));
+            self.sent.set(Some(tile));
+        }
+    }
 }
 
 impl Media {
@@ -477,6 +616,10 @@ impl Media {
             mic_muted: false,
             peer_packets: Arc::new(Mutex::new((Instant::now(), None))),
             streams: StreamStats::default(),
+            screen_keyframes: Arc::default(),
+            screen_ready: Arc::default(),
+            pads: Mutex::new(None),
+            idle: None,
         };
         // A missing/busy camera or microphone must not prevent talking.
         if let Some(src) = media.cfg.camera.clone() {
@@ -715,6 +858,9 @@ impl Media {
         }
         self.receive_screen = None;
         self.forget_streams(&["shared screen", "shared sound"]);
+        *self.screen_keyframes.lock().unwrap() = keyframe::Requests::default();
+        self.screen_ready.store(false, Ordering::Relaxed);
+        self.refresh_pads();
         if on {
             let desc = pipelines::receive_screen(
                 &self.cfg.channels,
@@ -733,11 +879,12 @@ impl Media {
                         self.cfg.ports.screen,
                     );
                     if let Some(pad) = p
-                        .by_name("rtph264depay0")
+                        .by_name(pipelines::VIDEO_DEPAY)
                         .and_then(|e| e.static_pad("sink"))
                     {
                         log_first_buffer(&pad, "receive-screen: first RTP packet");
                     }
+                    watch_keyframes(&p, &self.screen_keyframes, &self.screen_ready);
                     if let Some(pad) = p
                         .get()
                         .iterate_elements()
@@ -755,7 +902,117 @@ impl Media {
         }
     }
 
+    /// Whether to ask the presenter for a keyframe now (we receive their
+    /// screen and have had none since starting or losing packets).  Rate
+    /// limited: call it often.
+    pub fn screen_keyframe_due(&self) -> bool {
+        self.receive_screen.is_some() && self.screen_keyframes.lock().unwrap().due(Instant::now())
+    }
+
+    /// The partner asked for a keyframe of the screen we share.
+    pub fn force_screen_keyframe(&self) {
+        let Some(pad) = self
+            .screen
+            .as_ref()
+            .and_then(|p| p.by_name(pipelines::SCREEN_ENCODER))
+            .and_then(|e| e.static_pad("src"))
+        else {
+            return;
+        };
+        debug("screen: keyframe requested by the partner");
+        pad.send_event(
+            gst_video::UpstreamForceKeyUnitEvent::builder()
+                .all_headers(true)
+                .build(),
+        );
+    }
+
+    /// Sets the compositor inputs; the partner's screen stays hidden until a
+    /// complete picture of it arrived (see [`Media::refresh_pads`]).
     pub fn apply_pads(&self, pads: &Pads) {
+        let ready = self.screen_ready.load(Ordering::Relaxed);
+        *self.pads.lock().unwrap() = Some((*pads, ready));
+        let mut shown = pads.show_remote_screen(ready);
+        match &self.idle {
+            Some(idle) if shown.idle.alpha > 0.0 => {
+                idle.send((shown.idle.w.max(0) as u32, shown.idle.h.max(0) as u32));
+            }
+            _ => shown.idle.alpha = 0.0,
+        }
+        self.set_pads(&shown);
+    }
+
+    fn reapply_pads(&self) {
+        let pads = self.pads.lock().unwrap().map(|(p, _)| p);
+        if let Some(p) = pads {
+            self.apply_pads(&p);
+        }
+    }
+
+    /// Shows the picture at `path` in the shared space while nobody shares
+    /// (`None`: black).  Returns its size in pixels.
+    pub fn set_idle_image(&mut self, path: Option<&Path>) -> anyhow::Result<Option<(u32, u32)>> {
+        let Some(path) = path else {
+            self.idle = None;
+            self.reapply_pads();
+            return Ok(None);
+        };
+        // A picture that cannot be read keeps the current one.
+        let pixbuf = gtk::gdk_pixbuf::Pixbuf::from_file(path)
+            .with_context(|| format!("cannot read the picture {}", path.display()))?;
+        // Photos are often stored sideways with an orientation tag.
+        let pixbuf = pixbuf.apply_embedded_orientation().unwrap_or(pixbuf);
+        // The old feeder goes first: stopping it clears the channel.
+        self.idle = None;
+        let pipe = Pipe::launch(
+            "idle",
+            &pipelines::idle_picture(&self.cfg.channels),
+            &self.hooks,
+        )
+        .and_then(Pipe::play);
+        let idle = match pipe {
+            Ok(pipe) => Idle {
+                pipe,
+                pixbuf,
+                sent: Default::default(),
+            },
+            Err(e) => {
+                self.reapply_pads();
+                return Err(e);
+            }
+        };
+        let size = idle.size();
+        debug(&format!(
+            "idle picture {}: {}x{}",
+            path.display(),
+            size.0,
+            size.1
+        ));
+        self.idle = Some(idle);
+        self.reapply_pads();
+        Ok(Some(size))
+    }
+
+    /// Size of the idle picture, if one is set.
+    pub fn idle_image_size(&self) -> Option<(u32, u32)> {
+        self.idle.as_ref().map(Idle::size)
+    }
+
+    /// Shows the partner's screen once its first complete picture arrived
+    /// (or hides it again when it stopped).  Cheap: call it often.
+    pub fn refresh_pads(&self) {
+        let ready = self.screen_ready.load(Ordering::Relaxed);
+        let pads = match *self.pads.lock().unwrap() {
+            Some((pads, applied)) if applied != ready => pads,
+            _ => return,
+        };
+        if ready {
+            debug("receive-screen: complete picture arrived, showing it");
+        }
+        self.apply_pads(&pads);
+    }
+
+    fn set_pads(&self, pads: &Pads) {
         thread_local!(static LAST: std::cell::Cell<(f64, f64)> = const { std::cell::Cell::new((-1.0, -1.0)) });
         let alphas = (pads.screen_local.alpha, pads.screen_remote.alpha);
         if LAST.with(|l| l.replace(alphas)) != alphas {
@@ -778,6 +1035,14 @@ impl Media {
                 continue;
             };
             set_pad(&pad, &p);
+        }
+        if let Some(pad) = self
+            .program
+            .by_name(&format!("q_{}", pipelines::IDLE_INPUT))
+            .and_then(|q| q.static_pad("src"))
+            .and_then(|p| p.peer())
+        {
+            set_pad(&pad, &pads.idle);
         }
     }
 

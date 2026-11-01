@@ -121,7 +121,14 @@ claim a container run proves anything about the user's real network.
   processing is done in a pad probe (`install_mic_processing`).
 - matroskamux (1.20) mangles track titles with spaces/non-ASCII; see
   `pipelines::mkv_title`.
-- LAN H.264: a keyframe every second (late receivers need one) with the frame
-  size capped by `vbv-buf-capacity`: uncapped 1080p keyframes overflow the UDP
-  receive buffer (green blocks). Intra refresh avoids bursts but late
-  receivers then stay grey for long.
+- LAN H.264: keyframes with the frame size capped by `vbv-buf-capacity`
+  (uncapped 1080p keyframes overflow the UDP receive buffer: green blocks).
+  A capped keyframe of screen content is much blurrier than the frames before
+  it: with one every second the partner's shared screen visibly pulsed in
+  recordings.  So the screen gets keyframes on request (`Msg::ScreenKeyframe`,
+  `crate::keyframe`); the camera keeps one per second.  Tests passing a screen
+  between two `Media` must relay requests (`wait_for_shared`).  Intra
+  refresh avoids bursts but late receivers then stay grey for long.
+- The idle picture is scaled once (gdk-pixbuf) to its pad's exact size and
+  fed through an `intervideosrc` without a fixed size, so the compositor
+  never scales it again (sharpness).

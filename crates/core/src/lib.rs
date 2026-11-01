@@ -8,6 +8,8 @@ pub mod control;
 pub mod deps;
 pub mod gate;
 pub mod health;
+pub mod idle_image;
+pub mod keyframe;
 pub mod layout;
 pub mod levels;
 pub mod mic_channel;
