@@ -4,3 +4,8 @@ members = ["crates/core", "crates/app"]
 
 [profile.release]
 lto = "thin"
+
+# Per-pixel camera filtering (skin smoothing) must stay real-time in debug
+# builds too.
+[profile.dev.package.twofcast-core]
+opt-level = 3

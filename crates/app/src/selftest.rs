@@ -109,6 +109,8 @@ fn media_loopback() -> anyhow::Result<String> {
             duck_db: None,
             playback: false,
             h264_decoder: None,
+            smooth_skin_strength: 0.6,
+            warmth: 0.0,
         },
         errors,
     )?;

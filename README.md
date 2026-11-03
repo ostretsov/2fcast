@@ -23,7 +23,18 @@ video podcast on Ubuntu:
   loudness, thin mark = peak). Keep speech in the green; yellow is loud, red
   (above −3 dB) will distort. A muted mic reads "silent". Your own name is the
   bold one; hover over the meters to see which config file sets it.
-* **Webcams.** Both cameras are shown and recorded.
+* **Webcams.** Both cameras are shown and recorded. With more than one webcam,
+  pick yours under **Camera** (or **No camera**); it switches at once, also
+  while recording, and is remembered in `config.toml`.
+* **Smooth skin** (on by default). **Smooth skin** in the **Camera** menu softens skin
+  texture in *your* camera picture (your partner switches theirs on their
+  machine). Only skin-coloured areas are touched and edges like eyes and hair
+  stay sharp; you, your partner and the recording all see the result. The
+  **Smoothness** slider below it sets how much. It costs about 6–8 ms of one
+  CPU core per frame, no GPU.
+* **Warmth.** The **Warmth** slider in the **Camera** menu gives your picture
+  warmer, slightly more golden and saturated colours (full by default; far
+  left: off; about 0.2 ms per frame). Both sliders are remembered in `config.toml`.
 * **Shared space.** Either of you clicks **Share…** and picks a window (a
   browser with a YouTube video, a presentation, …) or the entire screen. The
   other one sees it immediately. Either of you can share at any time; the
@@ -95,7 +106,7 @@ video podcast on Ubuntu:
 On each machine (Ubuntu 22.04 or newer, X11 session):
 
 ```sh
-sudo apt install ./2fcast_0.6.0_amd64.deb
+sudo apt install ./2fcast_0.7.0_amd64.deb
 ```
 
 The package is self-contained, like Discord: it brings its own GTK 4,
@@ -110,7 +121,7 @@ Build the package yourself (on the *oldest* Ubuntu it should run on):
 ```sh
 curl https://sh.rustup.rs -sSf | sh       # Rust, once
 make deps                                 # build dependencies, once (sudo)
-make deb                                  # -> target/2fcast_0.6.0_amd64.deb
+make deb                                  # -> target/2fcast_0.7.0_amd64.deb
 make deb V=0.3.1                          # bump the version (crates, Cargo.lock, README), then build
 make docker-test                          # install it in clean Ubuntu containers + self-test
 ```
@@ -141,7 +152,7 @@ instances on one machine — your webcam as "Artem", a test camera as
 | key | default | meaning |
 |---|---|---|
 | `name` | your user name | shown to the other person |
-| `camera` | `"auto"` | `"auto"`, `"/dev/video2"`, `"none"` or `"test"` |
+| `camera` | `"auto"` | `"auto"` (first webcam), a device (`"/dev/video2"`, or a stable `/dev/v4l/by-id/…` link, which the **Camera** menu saves), `"none"` or `"test"` |
 | `microphone` | `"default"` | PulseAudio source (`pactl list sources short`), `"none"`, `"test"` |
 | `microphone_channel` | `"auto"` | `"auto"`, `"both"`, `"left"` (input 1) or `"right"` (input 2) |
 | `noise_gate` | `true` | silence the mic while you are not speaking |
@@ -154,6 +165,8 @@ instances on one machine — your webcam as "Artem", a test camera as
 | `output_dir` | `~/Videos/2fcast` | where recordings go |
 | `base_port` | `47100` | TCP control port; UDP media uses `base_port+2 … +8` |
 | `peer_address` | none | `"192.168.1.20:47100"` if your network blocks multicast (set it on one machine) |
+| `smooth_skin_strength` | `1.0` | how strongly **Smooth skin** works, `0`…`1` (the **Smoothness** slider) |
+| `camera_warmth` | `1.0` | warm colour grade of my camera, `0` (off) … `1` (the **Warmth** slider) |
 | `record_bitrate_kbps` | `6000` | video bitrate of the recording (~2.7 GB/hour max) |
 | `record_preset` | `"veryfast"` | x264 speed: `superfast` uses less CPU, `faster` gives better quality |
 
@@ -181,6 +194,10 @@ S=/run/user/$UID/2fcast.sock
 2fcast --ctl $S '{"cmd":"record","on":true}'             # and false to stop
 2fcast --ctl $S '{"cmd":"mute","on":true}'
 2fcast --ctl $S '{"cmd":"hide_self_view","on":true}'     # my camera hidden on my screen only
+2fcast --ctl $S '{"cmd":"cameras"}'                      # webcams (device, name, active)
+2fcast --ctl $S '{"cmd":"camera","device":"/dev/video2"}'  # or "auto", "none", "test"
+2fcast --ctl $S '{"cmd":"smooth_skin","on":true,"strength":0.8}'  # either field alone too
+2fcast --ctl $S '{"cmd":"warmth","value":0.5}'           # 0 = off; state.camera_look_ms: cost
 2fcast --ctl $S '{"cmd":"idle_image","path":"/home/me/brb.png"}'  # omit path: black again
 2fcast --ctl $S '{"cmd":"preset","name":"cams_only"}'    # screen_cams_right, screen_cams_overlay, cams_only, screen_only
 2fcast --ctl $S '{"cmd":"draw","points":[[0.1,0.5],[0.9,0.5]]}'
@@ -205,7 +222,8 @@ testing the real app without simulating mouse clicks.
 * **They don't find each other** — a firewall may block mDNS or the ports:
   `sudo ufw allow 5353/udp && sudo ufw allow 47100:47110/tcp && sudo ufw allow 47100:47110/udp`.
   Or set `peer_address` on one machine.
-* **Camera busy** — close other apps using it (OBS, browser tabs).
+* **Camera busy** — close other apps using it (OBS, browser tabs), or pick
+  another webcam under **Camera**.
 * **Wayland session** — window capture needs X11 ("Ubuntu on Xorg" at login).
 * **Your voice is only in one ear / too quiet** — see `microphone_channel`.
 * **Words are cut off at the start** — lower `noise_gate_db` (or `noise_gate = false`).

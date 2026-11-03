@@ -12,6 +12,7 @@ use twofcast_core::annotations::{
     ARROW_MAX_WIDTH, ARROW_MIN_WIDTH, ARROW_WIDTH, AnnotOp, IdGen, Item, PALETTE, Pt, Rgb,
     STROKE_WIDTH, Shape, TEXT_SIZE,
 };
+use twofcast_core::camera;
 use twofcast_core::config::{self, Config};
 use twofcast_core::control;
 use twofcast_core::deps;
@@ -20,7 +21,7 @@ use twofcast_core::layout::{CANVAS_H, CANVAS_W, Fit, Layout, PadParams, Preset, 
 use twofcast_core::levels;
 use twofcast_core::mic_channel::Mode as MicMode;
 use twofcast_core::net::{Net, NetConfig, NetEvent};
-use twofcast_core::pipelines::{Channels, Ports, ScreenSource, TrackNames};
+use twofcast_core::pipelines::{CamSource, Channels, Ports, ScreenSource, TrackNames};
 use twofcast_core::protocol::Msg;
 use twofcast_core::pulse::Target;
 use twofcast_core::session::{Event, Out, Session};
@@ -164,6 +165,18 @@ pub struct App {
 }
 
 type Shared = Rc<RefCell<App>>;
+
+/// For people (and the control API): 0.6000000238 -> 0.6.
+fn round2(x: f32) -> f64 {
+    (f64::from(x) * 100.0).round() / 100.0
+}
+
+/// A camera-look slider.
+#[derive(Clone, Copy, Debug)]
+enum Look {
+    Smoothness,
+    Warmth,
+}
 
 /// Runs `f` on the app state.  GTK may emit a signal while another handler
 /// still runs (opening a popover cancels the drag gesture, for example); such
@@ -439,6 +452,8 @@ fn build(
             duck_db: voice::duck_from_setting(cfg.duck_partner_db),
             playback: true,
             h264_decoder: None,
+            smooth_skin_strength: cfg.smooth_skin_strength as f32,
+            warmth: cfg.camera_warmth as f32,
         },
         on_error,
     )?;
@@ -598,6 +613,14 @@ fn build_widgets(gapp: &gtk::Application, cfg: &Config, cfg_dir: &std::path::Pat
         )
         .build();
     self_view.set_widget_name("self-view");
+    let camera_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    camera_box.set_widget_name("camera-box");
+    let camera_button = gtk::MenuButton::builder()
+        .label("Camera")
+        .popover(&gtk::Popover::builder().child(&camera_box).build())
+        .tooltip_text("Pick the webcam your partner sees")
+        .build();
+    camera_button.set_widget_name("camera");
     let layout_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     layout_box.set_widget_name("layout-box");
     let layout_button = gtk::MenuButton::builder()
@@ -610,6 +633,7 @@ fn build_widgets(gapp: &gtk::Application, cfg: &Config, cfg_dir: &std::path::Pat
     header.pack_end(&record);
     header.pack_end(&mic);
     header.pack_end(&self_view);
+    header.pack_end(&camera_button);
     header.pack_end(&layout_button);
     header.pack_end(&arrange_slot);
     window.set_titlebar(Some(&header));
@@ -1003,14 +1027,22 @@ fn connect_signals(app: &Shared) {
         mic.set_sensitive(false);
     }
     let self_view = find::<gtk::ToggleButton>(&window, "self-view").unwrap();
-    if !app.borrow().media.has_camera() {
-        self_view.set_visible(false);
+    app.borrow().sync_camera_widgets();
+    let camera_button = find::<gtk::MenuButton>(&window, "camera").unwrap();
+    if let Some(p) = camera_button.popover() {
+        let a = app.clone();
+        p.connect_show(move |_| {
+            let shared = a.clone();
+            with(&a, move |app| app.fill_camera_list(&shared));
+        });
     }
     let a = app.clone();
     self_view.connect_toggled(move |b| {
         let hidden = b.is_active();
         with(&a, move |app| app.set_self_view_hidden(hidden));
     });
+    let smooth = app.borrow().prefs.smooth_skin;
+    app.borrow().media.set_smooth_skin(smooth);
     let hidden = app.borrow().prefs.hide_self_view;
     app.borrow().sync_self_view_button(hidden);
     let a = app.clone();
@@ -1638,6 +1670,7 @@ impl App {
     fn handle_control(&mut self, cmd: control::Command, shared: &Shared) -> control::Reply {
         use control::Command as C;
         let mut windows_out = vec![];
+        let mut cameras_out = vec![];
         let result: Result<(), String> = match cmd {
             C::State => Ok(()),
             C::Windows => windows::list().map_err(|e| format!("{e:#}")).map(|ws| {
@@ -1687,6 +1720,24 @@ impl App {
                 Ok(())
             }
             C::IdleImage { path } => self.set_idle_image(path.map(PathBuf::from)),
+            C::Cameras => {
+                cameras_out = self.camera_entries();
+                Ok(())
+            }
+            C::Camera { device } => self.select_camera(&device),
+            C::SmoothSkin { on, strength } => {
+                if let Some(on) = on {
+                    self.set_smooth_skin(on);
+                }
+                if let Some(s) = strength {
+                    self.set_camera_look(Look::Smoothness, s);
+                }
+                Ok(())
+            }
+            C::Warmth { value } => {
+                self.set_camera_look(Look::Warmth, value);
+                Ok(())
+            }
             C::Preset { name } => match control::parse_preset(&name) {
                 None => Err(format!("unknown preset {name}")),
                 Some(p) => {
@@ -1777,6 +1828,7 @@ impl App {
         match result {
             Ok(()) => control::Reply {
                 windows: windows_out,
+                cameras: cameras_out,
                 ..control::Reply::ok(state)
             },
             Err(e) => control::Reply::error(e, state),
@@ -1804,7 +1856,16 @@ impl App {
             recording_file_bytes: self.recording_file_bytes(),
             disk_free_bytes: self.disk_free_bytes(),
             muted: self.media.is_mic_muted(),
+            camera: match self.media.camera_source() {
+                Some(CamSource::Device { path, .. }) => Some(path.clone()),
+                Some(CamSource::Test(_)) => Some("test".into()),
+                None => None,
+            },
             self_view_hidden: self.prefs.hide_self_view,
+            smooth_skin: self.media.smooth_skin(),
+            smooth_skin_strength: round2(self.media.smooth_skin_strength()),
+            warmth: round2(self.media.warmth()),
+            camera_look_ms: self.media.camera_look_ms(),
             idle_image: self
                 .prefs
                 .idle_image
@@ -2253,6 +2314,227 @@ impl App {
         }
         self.sync_self_view_button(on);
         self.ui.area.queue_draw();
+    }
+
+    /// Webcams to pick from, the one in use ticked.
+    fn camera_entries(&self) -> Vec<control::CameraEntry> {
+        let active = match self.media.camera_source() {
+            Some(CamSource::Device { path, .. }) => Some(path.clone()),
+            Some(CamSource::Test(_)) => Some("test".to_string()),
+            None => None,
+        };
+        let mut out: Vec<control::CameraEntry> = crate::media::video_devices()
+            .into_iter()
+            .map(|d| control::CameraEntry {
+                active: active.as_deref() == Some(d.path.as_str()),
+                device: d.path,
+                name: d.name,
+            })
+            .collect();
+        if let Some(a) = active.filter(|_| !out.iter().any(|e| e.active)) {
+            out.push(control::CameraEntry {
+                name: if a == "test" {
+                    "Test picture".into()
+                } else {
+                    a.clone()
+                },
+                device: a,
+                active: true,
+            });
+        }
+        out
+    }
+
+    fn fill_camera_list(&self, shared: &Shared) {
+        let Some(list) = find::<gtk::Box>(&self.ui.window, "camera-box") else {
+            return;
+        };
+        while let Some(c) = list.first_child() {
+            list.remove(&c);
+        }
+        let entries = self.camera_entries();
+        let none_active = !entries.iter().any(|e| e.active);
+        let add = |label: &str, tooltip: &str, device: String, active: bool| {
+            let mark = if active { "✓" } else { "    " };
+            let b = gtk::Button::builder()
+                .label(format!("{mark}  {label}"))
+                .tooltip_text(tooltip)
+                .has_frame(false)
+                .build();
+            if let Some(l) = b.child().and_downcast::<gtk::Label>() {
+                l.set_xalign(0.0);
+                l.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                l.set_max_width_chars(50);
+            }
+            let a = shared.clone();
+            b.connect_clicked(move |b| {
+                if let Some(p) = b.ancestor(gtk::Popover::static_type()) {
+                    p.downcast::<gtk::Popover>().unwrap().popdown();
+                }
+                let device = device.clone();
+                with(&a, move |app| {
+                    if let Err(e) = app.select_camera(&device) {
+                        app.ui.error.set_text(&e);
+                    }
+                });
+            });
+            list.append(&b);
+        };
+        if entries.is_empty() {
+            let l = gtk::Label::new(Some("No webcam found"));
+            l.add_css_class("dim-label");
+            list.append(&l);
+        }
+        for e in entries {
+            add(&e.name, &e.device, e.device.clone(), e.active);
+        }
+        list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        add(
+            "No camera",
+            "Send and record no picture of me",
+            "none".into(),
+            none_active,
+        );
+        list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        let smooth = gtk::CheckButton::builder()
+            .label("Smooth skin")
+            .active(self.media.smooth_skin())
+            .tooltip_text(
+                "Softens skin texture in your camera picture (also for your partner and in \
+                 the recording); edges like eyes and hair stay sharp.",
+            )
+            .build();
+        smooth.set_widget_name("smooth-skin");
+        list.append(&smooth);
+        let slider = |look: Look, value: f32, tooltip: &str| {
+            let s = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.05);
+            s.set_value(f64::from(value));
+            s.set_draw_value(false);
+            s.set_hexpand(true);
+            s.set_size_request(180, -1);
+            s.set_tooltip_text(Some(tooltip));
+            let a = shared.clone();
+            s.connect_value_changed(move |s| {
+                let v = s.value();
+                with(&a, move |app| app.set_camera_look(look, v));
+            });
+            s
+        };
+        let row = |label: &str, scale: &gtk::Scale| {
+            let b = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            b.set_margin_start(8);
+            let l = gtk::Label::new(Some(label));
+            l.set_width_chars(10);
+            l.set_xalign(0.0);
+            b.append(&l);
+            b.append(scale);
+            list.append(&b);
+            b
+        };
+        let smoothness = slider(
+            Look::Smoothness,
+            self.media.smooth_skin_strength(),
+            "Less (left) or more (right) smoothing",
+        );
+        let smoothness_row = row("Smoothness", &smoothness);
+        smoothness_row.set_sensitive(self.media.smooth_skin());
+        let a = shared.clone();
+        smooth.connect_toggled(move |b| {
+            let on = b.is_active();
+            smoothness_row.set_sensitive(on);
+            with(&a, move |app| app.set_smooth_skin(on));
+        });
+        let warmth = slider(
+            Look::Warmth,
+            self.media.warmth(),
+            "Warmer, more golden colours in your camera picture (left: off)",
+        );
+        row("Warmth", &warmth);
+    }
+
+    /// Smoothness or warmth of my camera picture (sliders, control API);
+    /// remembered in `config.toml` in steps of 0.05.
+    fn set_camera_look(&mut self, look: Look, value: f64) {
+        let v = (value.clamp(0.0, 1.0) * 20.0).round() / 20.0;
+        let (current, apply): (f64, fn(&Media, f32)) = match look {
+            Look::Smoothness => (
+                self.cfg.smooth_skin_strength,
+                Media::set_smooth_skin_strength,
+            ),
+            Look::Warmth => (self.cfg.camera_warmth, Media::set_warmth),
+        };
+        apply(&self.media, v as f32);
+        if (current - v).abs() < 1e-6 {
+            return;
+        }
+        let set = |c: &mut Config| match look {
+            Look::Smoothness => c.smooth_skin_strength = v,
+            Look::Warmth => c.camera_warmth = v,
+        };
+        set(&mut self.cfg);
+        // Re-read the file: the user may have edited it meanwhile.
+        let saved = Config::load_or_create(&self.cfg_dir).and_then(|mut c| {
+            set(&mut c);
+            c.save(&self.cfg_dir)
+        });
+        if let Err(e) = saved {
+            debug(&format!("cannot save the camera look: {e:#}"));
+        }
+    }
+
+    /// Skin smoothing on my camera picture (Camera menu, control API).
+    fn set_smooth_skin(&mut self, on: bool) {
+        self.media.set_smooth_skin(on);
+        if self.prefs.smooth_skin != on {
+            self.prefs.smooth_skin = on;
+            if let Err(e) = config::save_ui_prefs(&self.cfg_dir, &self.prefs) {
+                debug(&format!("cannot save ui prefs: {e:#}"));
+            }
+        }
+    }
+
+    /// Switches my camera (menu, control API) and remembers it in
+    /// `config.toml`, as a path that survives renumbering of the devices.
+    fn select_camera(&mut self, device: &str) -> Result<(), String> {
+        let setting = match device {
+            "auto" | "none" | "test" => device.to_string(),
+            path => camera::stable_path(path, std::path::Path::new("/dev/v4l")),
+        };
+        let src = camera_source(&setting);
+        if setting != "none" && src.is_none() {
+            return Err("no webcam found".into());
+        }
+        debug(&format!("select camera {setting:?}: {src:?}"));
+        let started = self.media.set_camera(src);
+        self.sync_camera_widgets();
+        self.ui.area.queue_draw();
+        started.map_err(|e| format!("{e:#}"))?;
+        if self.cfg.camera != setting {
+            self.cfg.camera = setting.clone();
+            // Re-read the file: the user may have edited it meanwhile.
+            let saved = Config::load_or_create(&self.cfg_dir).and_then(|mut c| {
+                c.camera = setting;
+                c.save(&self.cfg_dir)
+            });
+            if let Err(e) = saved {
+                debug(&format!("cannot save the camera choice: {e:#}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Self-view only makes sense with a camera; the Camera button names it.
+    fn sync_camera_widgets(&self) {
+        if let Some(b) = find::<gtk::ToggleButton>(&self.ui.window, "self-view") {
+            b.set_visible(self.media.has_camera());
+        }
+        if let Some(b) = find::<gtk::MenuButton>(&self.ui.window, "camera") {
+            b.set_label(if self.media.has_camera() {
+                "Camera"
+            } else {
+                "No camera"
+            });
+        }
     }
 
     fn sync_self_view_button(&self, hidden: bool) {

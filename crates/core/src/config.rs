@@ -46,6 +46,10 @@ pub struct Config {
     pub record_bitrate_kbps: u32,
     /// x264 speed preset for the recording: ultrafast/superfast/veryfast/faster.
     pub record_preset: String,
+    /// How strongly "Smooth skin" (switched in the Camera menu) works, 0..1.
+    pub smooth_skin_strength: f64,
+    /// Warm colour grade of my camera, 0 (off) .. 1 (Camera menu).
+    pub camera_warmth: f64,
 }
 
 impl Default for Config {
@@ -72,6 +76,8 @@ impl Default for Config {
             peer_address: None,
             record_bitrate_kbps: 6000,
             record_preset: "veryfast".into(),
+            smooth_skin_strength: 1.0,
+            camera_warmth: 1.0,
         }
     }
 }
@@ -142,13 +148,25 @@ pub fn save_layout(dir: &Path, layout: &Layout) -> anyhow::Result<()> {
 
 /// Choices made with buttons that should survive a restart (`ui.json`;
 /// kept apart from `config.toml`, which the user edits by hand).
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct UiPrefs {
     /// My own camera is covered on my screen (still sent and recorded).
     pub hide_self_view: bool,
     /// Picture shown in the shared space while nobody shares.
     pub idle_image: Option<PathBuf>,
+    /// My camera picture goes through the skin smoothing filter.
+    pub smooth_skin: bool,
+}
+
+impl Default for UiPrefs {
+    fn default() -> Self {
+        UiPrefs {
+            hide_self_view: false,
+            idle_image: None,
+            smooth_skin: true,
+        }
+    }
 }
 
 pub fn load_ui_prefs(dir: &Path) -> UiPrefs {
@@ -199,9 +217,11 @@ mod tests {
     fn ui_prefs_roundtrip_and_default() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(load_ui_prefs(dir.path()), UiPrefs::default());
+        assert!(UiPrefs::default().smooth_skin, "on by default");
         let p = UiPrefs {
             hide_self_view: true,
             idle_image: Some("/home/me/Pictures/logo 1.png".into()),
+            smooth_skin: true,
         };
         save_ui_prefs(dir.path(), &p).unwrap();
         assert_eq!(load_ui_prefs(dir.path()), p);
@@ -211,7 +231,7 @@ mod tests {
             load_ui_prefs(dir.path()),
             UiPrefs {
                 hide_self_view: true,
-                idle_image: None
+                ..Default::default()
             }
         );
         std::fs::write(dir.path().join("ui.json"), "garbage").unwrap();
@@ -253,6 +273,7 @@ mod tests {
         assert_eq!(c.name, "Ivan");
         assert_eq!(c.base_port, 47200);
         assert_eq!(c.camera, "auto");
+        assert_eq!((c.smooth_skin_strength, c.camera_warmth), (1.0, 1.0));
         assert_eq!(
             (c.microphone_channel.as_str(), c.noise_gate, c.noise_gate_db),
             ("auto", true, -45.0)

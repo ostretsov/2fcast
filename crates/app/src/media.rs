@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,7 @@ use twofcast_core::mic_channel::{Mode as MicMode, Pick, Picker};
 use twofcast_core::pipelines::{
     self, CamSource, Channels, MicSource, Ports, ScreenSource, TrackNames,
 };
+use twofcast_core::skin::{self, Planes, SkinFilter};
 use twofcast_core::voice::{Ducker, Voice, VoiceSettings};
 
 pub type ErrorFn = Arc<dyn Fn(String) + Send + Sync>;
@@ -110,6 +111,117 @@ fn install_duck(pad: &gst::Pad, hooks: &Hooks, ducker: Ducker) {
             for (b, x) in map.as_chunks_mut::<2>().0.iter_mut().zip(samples) {
                 *b = x.to_le_bytes();
             }
+        }
+        gst::PadProbeReturn::Ok
+    });
+}
+
+/// Camera look (skin smoothing, warmth) and how long it takes, shared with
+/// the camera's streaming thread.  Values are f32 bits, changed live.
+#[derive(Default)]
+struct Look {
+    smooth: AtomicBool,
+    strength: AtomicU32,
+    warmth: AtomicU32,
+    /// Frames and time since the last report; last average (ms per frame).
+    stats: Mutex<(u32, Duration, Option<f64>)>,
+}
+
+impl Look {
+    fn strength(&self) -> f32 {
+        f32::from_bits(self.strength.load(Ordering::Relaxed))
+    }
+    fn warmth(&self) -> f32 {
+        f32::from_bits(self.warmth.load(Ordering::Relaxed))
+    }
+    fn active(&self) -> bool {
+        (self.smooth.load(Ordering::Relaxed) && self.strength() > 0.0) || self.warmth() > 0.0
+    }
+}
+
+/// Frames averaged per timing report (5 s).
+const LOOK_REPORT_FRAMES: u32 = 150;
+
+/// Smooths skin and warms the colours of the camera's I420 frames, as far
+/// as switched on.
+fn install_camera_look(pad: &gst::Pad, look: Arc<Look>) {
+    use gst_video::prelude::*;
+    let caps: gst::Caps = pipelines::cam_caps().parse().expect("camera caps");
+    let Ok(info) = gst_video::VideoInfo::from_caps(&caps) else {
+        return;
+    };
+    // Filter buffers, copies of the chroma, warmth tables (and their warmth).
+    let state = Mutex::new((
+        SkinFilter::new(),
+        Vec::new(),
+        Vec::new(),
+        (-1.0f32, skin::warm_tables(0.0)),
+    ));
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_, probe| {
+        if !look.active() {
+            return gst::PadProbeReturn::Ok;
+        }
+        let Some(gst::PadProbeData::Buffer(buffer)) = &mut probe.data else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let started = Instant::now();
+        let Ok(mut frame) =
+            gst_video::VideoFrameRef::from_buffer_ref_writable(buffer.make_mut(), &info)
+        else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let mut st = state.lock().unwrap();
+        let (filter, u, v, tables) = &mut *st;
+        let strength = look.strength();
+        if look.smooth.load(Ordering::Relaxed) && strength > 0.0 {
+            // The skin mask reads the chroma: copy it, so the brightness can
+            // be borrowed mutably from the same frame.
+            let (Ok(pu), Ok(pv)) = (frame.plane_data(1), frame.plane_data(2)) else {
+                return gst::PadProbeReturn::Ok;
+            };
+            u.clear();
+            u.extend_from_slice(pu);
+            v.clear();
+            v.extend_from_slice(pv);
+            let strides = frame.plane_stride();
+            let (y_stride, uv_stride) = (strides[0] as usize, strides[1] as usize);
+            let (width, height) = (frame.width() as usize, frame.height() as usize);
+            if let Ok(y) = frame.plane_data_mut(0) {
+                filter.process(
+                    Planes {
+                        width,
+                        height,
+                        y,
+                        y_stride,
+                        u,
+                        v,
+                        uv_stride,
+                    },
+                    strength,
+                );
+            }
+        }
+        let warmth = look.warmth();
+        if warmth > 0.0 {
+            if tables.0 != warmth {
+                *tables = (warmth, skin::warm_tables(warmth));
+            }
+            let t = &tables.1;
+            if let Ok(u) = frame.plane_data_mut(1) {
+                skin::warm(u, &t.0);
+            }
+            if let Ok(v) = frame.plane_data_mut(2) {
+                skin::warm(v, &t.1);
+            }
+        }
+        drop(st);
+        let mut stats = look.stats.lock().unwrap();
+        stats.0 += 1;
+        stats.1 += started.elapsed();
+        if stats.0 >= LOOK_REPORT_FRAMES {
+            let ms = stats.1.as_secs_f64() * 1000.0 / stats.0 as f64;
+            *stats = (0, Duration::ZERO, Some(ms));
+            debug(&format!("camera look: {ms:.1} ms per frame"));
         }
         gst::PadProbeReturn::Ok
     });
@@ -450,6 +562,10 @@ pub struct MediaConfig {
     pub playback: bool,
     /// H.264 decoder for the peer's video; `None` picks the best installed.
     pub h264_decoder: Option<&'static str>,
+    /// Strength of "Smooth skin" while it is on, 0..1.
+    pub smooth_skin_strength: f32,
+    /// Warm colour grade of my camera, 0 (off) .. 1.
+    pub warmth: f32,
 }
 
 pub struct Media {
@@ -457,6 +573,7 @@ pub struct Media {
     hooks: Hooks,
     program: Pipe,
     camera: Option<Pipe>,
+    look: Arc<Look>,
     mic: Option<Pipe>,
     screen: Option<Pipe>,
     receive: Option<Pipe>,
@@ -600,11 +717,17 @@ impl Media {
             log_lag(&pad, program.get().clone());
         }
 
+        let look = Arc::new(Look {
+            strength: AtomicU32::new(cfg.smooth_skin_strength.clamp(0.0, 1.0).to_bits()),
+            warmth: AtomicU32::new(cfg.warmth.clamp(0.0, 1.0).to_bits()),
+            ..Default::default()
+        });
         let mut media = Media {
             cfg,
             hooks,
             program,
             camera: None,
+            look,
             mic: None,
             screen: None,
             receive: None,
@@ -622,17 +745,10 @@ impl Media {
             idle: None,
         };
         // A missing/busy camera or microphone must not prevent talking.
-        if let Some(src) = media.cfg.camera.clone() {
-            match Pipe::launch(
-                "camera",
-                &pipelines::camera(&media.cfg.channels, &src),
-                &media.hooks,
-            )
-            .and_then(Pipe::play)
-            {
-                Ok(p) => media.camera = Some(p),
-                Err(e) => (media.hooks.on_error)(format!("camera: {e:#}")),
-            }
+        if let Some(src) = media.cfg.camera.clone()
+            && let Err(e) = media.set_camera(Some(src))
+        {
+            (media.hooks.on_error)(format!("{e:#}"));
         }
         if let Some(src) = media.cfg.mic.clone() {
             match Pipe::launch(
@@ -667,6 +783,88 @@ impl Media {
 
     pub fn has_camera(&self) -> bool {
         self.camera.is_some()
+    }
+
+    /// Switches skin smoothing of my camera picture (also while running).
+    pub fn set_smooth_skin(&self, on: bool) {
+        if self.look.smooth.swap(on, Ordering::Relaxed) != on {
+            debug(&format!("smooth skin: {}", if on { "on" } else { "off" }));
+            self.reset_look_stats();
+        }
+    }
+
+    pub fn smooth_skin(&self) -> bool {
+        self.look.smooth.load(Ordering::Relaxed)
+    }
+
+    /// How strongly skin is smoothed, 0..1.
+    pub fn set_smooth_skin_strength(&self, strength: f32) {
+        let s = strength.clamp(0.0, 1.0);
+        self.look.strength.store(s.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn smooth_skin_strength(&self) -> f32 {
+        self.look.strength()
+    }
+
+    /// Warm colour grade of my camera picture, 0 (off) .. 1.
+    pub fn set_warmth(&self, warmth: f32) {
+        let w = warmth.clamp(0.0, 1.0);
+        if self.look.warmth.swap(w.to_bits(), Ordering::Relaxed) != w.to_bits() {
+            self.reset_look_stats();
+        }
+    }
+
+    pub fn warmth(&self) -> f32 {
+        self.look.warmth()
+    }
+
+    fn reset_look_stats(&self) {
+        *self.look.stats.lock().unwrap() = (0, Duration::ZERO, None);
+    }
+
+    /// Average time of the camera look (smoothing, warmth) per frame over
+    /// the last 5 s; `None` while both are off.
+    pub fn camera_look_ms(&self) -> Option<f64> {
+        self.look
+            .stats
+            .lock()
+            .unwrap()
+            .2
+            .filter(|_| self.look.active())
+    }
+
+    /// The camera in use (`None`: none, or it failed to start).
+    pub fn camera_source(&self) -> Option<&CamSource> {
+        self.cfg.camera.as_ref().filter(|_| self.camera.is_some())
+    }
+
+    /// Switches to another camera (or none) while running; the partner and
+    /// the recording follow.  On error there is no camera.
+    pub fn set_camera(&mut self, src: Option<CamSource>) -> anyhow::Result<()> {
+        // Release the old device first: the new one may be the same.
+        self.camera = None;
+        self.cfg.camera = src.clone();
+        let Some(src) = src else {
+            debug("camera: off");
+            return Ok(());
+        };
+        let pipe = Pipe::launch(
+            "camera",
+            &pipelines::camera(&self.cfg.channels, &src),
+            &self.hooks,
+        )
+        .and_then(Pipe::play)?;
+        debug(&format!("camera: {src:?}"));
+        if let Some(pad) = pipe
+            .by_name(pipelines::CAM_FILTER)
+            .and_then(|e| e.static_pad("src"))
+        {
+            install_camera_look(&pad, self.look.clone());
+        }
+        self.camera = Some(pipe);
+        self.update_senders();
+        Ok(())
     }
 
     /// Current level of my voice (after mute) and of the partner's voice;
@@ -1168,26 +1366,65 @@ pub fn h264_decoder() -> &'static str {
 }
 
 /// Resolves the `camera` setting ("auto", a device path, "test", "none").
+/// Links such as `/dev/v4l/by-id/…` become the device node they point to.
 pub fn camera_source(setting: &str) -> Option<CamSource> {
+    if matches!(setting, "none" | "test") {
+        return camera_source_from(setting, &[]);
+    }
+    let mut devices = video_devices();
+    // Not listed: ask the device itself, or it runs in whatever format the
+    // driver defaults to (raw full HD at 2-5 fps on a C922).
+    if setting != "auto" && camera::find(setting, &devices).is_none() {
+        let path = camera::resolve(setting);
+        let modes = probe_modes(&path);
+        debug(&format!(
+            "camera {path} not listed; probed {} modes",
+            modes.len()
+        ));
+        if !modes.is_empty() {
+            devices.push(camera::Device {
+                name: path.clone(),
+                path,
+                modes,
+            });
+        }
+    }
+    camera_source_from(setting, &devices)
+}
+
+/// Capture modes of one V4L2 device, read from the device itself.
+fn probe_modes(path: &str) -> Vec<CamMode> {
+    let Ok(src) = gst::ElementFactory::make("v4l2src")
+        .property("device", path)
+        .build()
+    else {
+        return vec![];
+    };
+    let caps = src
+        .set_state(gst::State::Ready)
+        .ok()
+        .and_then(|_| src.static_pad("src"))
+        .map(|pad| pad.query_caps(None));
+    let _ = src.set_state(gst::State::Null);
+    caps.map(|c| modes_from_caps(&c)).unwrap_or_default()
+}
+
+pub fn camera_source_from(setting: &str, devices: &[camera::Device]) -> Option<CamSource> {
     match setting {
         "none" => None,
         "test" => Some(CamSource::Test(0x204060)),
         "auto" => {
-            let (path, modes) = video_devices().into_iter().next()?;
+            let d = camera::find("auto", devices)?;
             Some(CamSource::Device {
-                path,
-                mode: camera::choose(&modes),
+                path: d.path.clone(),
+                mode: camera::choose(&d.modes),
             })
         }
         path => {
-            let modes = video_devices()
-                .into_iter()
-                .find(|(p, _)| p == path)
-                .map(|(_, m)| m)
-                .unwrap_or_default();
+            let found = camera::find(path, devices);
             Some(CamSource::Device {
-                path: path.to_string(),
-                mode: camera::choose(&modes),
+                path: found.map_or_else(|| camera::resolve(path), |d| d.path.clone()),
+                mode: found.and_then(|d| camera::choose(&d.modes)),
             })
         }
     }
@@ -1202,15 +1439,33 @@ pub fn mic_source(setting: &str) -> Option<MicSource> {
     }
 }
 
-/// V4L2 cameras: (device path, supported modes).
-pub fn video_devices() -> Vec<(String, Vec<CamMode>)> {
+/// V4L2 cameras that can capture, in device-number order.
+/// Asks the V4L2 provider directly: it probes the devices synchronously,
+/// while a `DeviceMonitor` also starts the PipeWire provider, whose first
+/// listing is often still empty.
+pub fn video_devices() -> Vec<camera::Device> {
+    if let Some(p) = gst::DeviceProviderFactory::by_name("v4l2deviceprovider") {
+        let out = capture_devices(p.devices());
+        if !out.is_empty() {
+            return out;
+        }
+    }
     let monitor = gst::DeviceMonitor::new();
     monitor.add_filter(Some("Video/Source"), None);
     if monitor.start().is_err() {
         return vec![];
     }
+    let out = capture_devices(monitor.devices());
+    monitor.stop();
+    out
+}
+
+fn capture_devices(devices: impl IntoIterator<Item = gst::Device>) -> Vec<camera::Device> {
     let mut out = vec![];
-    for dev in monitor.devices() {
+    for dev in devices {
+        if dev.device_class() != "Video/Source" {
+            continue;
+        }
         let Some(props) = dev.properties() else {
             continue;
         };
@@ -1226,12 +1481,14 @@ pub fn video_devices() -> Vec<(String, Vec<CamMode>)> {
         };
         let modes = dev.caps().map(|c| modes_from_caps(&c)).unwrap_or_default();
         if !modes.is_empty() {
-            out.push((path, modes));
+            out.push(camera::Device {
+                path,
+                name: camera::clean_name(&dev.display_name()),
+                modes,
+            });
         }
     }
-    monitor.stop();
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out.dedup_by(|a, b| a.0 == b.0);
+    camera::sort_devices(&mut out);
     out
 }
 
@@ -1302,6 +1559,47 @@ mod tests {
     fn source_settings() {
         assert_eq!(camera_source("none"), None);
         assert!(matches!(camera_source("test"), Some(CamSource::Test(_))));
+        let mode = CamMode {
+            format: "YUY2".into(),
+            width: 640,
+            height: 480,
+            fps_n: 30,
+            fps_d: 1,
+        };
+        let devices = |paths: &[&str]| -> Vec<camera::Device> {
+            paths
+                .iter()
+                .map(|p| camera::Device {
+                    path: p.to_string(),
+                    name: "Cam".into(),
+                    modes: vec![mode.clone()],
+                })
+                .collect()
+        };
+        let two = devices(&["/dev/video0", "/dev/video2"]);
+        assert_eq!(camera_source_from("auto", &[]), None);
+        assert_eq!(
+            camera_source_from("auto", &two),
+            Some(CamSource::Device {
+                path: "/dev/video0".into(),
+                mode: Some(mode.clone())
+            })
+        );
+        assert_eq!(
+            camera_source_from("/dev/video2", &two),
+            Some(CamSource::Device {
+                path: "/dev/video2".into(),
+                mode: Some(mode.clone())
+            })
+        );
+        // Not listed (unplugged?): still tried, with whatever mode it offers.
+        assert_eq!(
+            camera_source_from("/dev/video7", &two),
+            Some(CamSource::Device {
+                path: "/dev/video7".into(),
+                mode: None
+            })
+        );
         assert_eq!(mic_source("default"), Some(MicSource::Default));
         assert_eq!(
             mic_source("alsa_input.x"),

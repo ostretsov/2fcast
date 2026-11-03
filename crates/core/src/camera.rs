@@ -52,6 +52,84 @@ pub fn choose(modes: &[CamMode]) -> Option<CamMode> {
         .cloned()
 }
 
+/// A webcam found on this machine.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Device {
+    /// Device node, e.g. "/dev/video2".
+    pub path: String,
+    /// Name for people, e.g. "Logitech C920".
+    pub name: String,
+    pub modes: Vec<CamMode>,
+}
+
+/// A device name for people: UVC drivers often report "Name: Name" cut to
+/// 31 characters ("Integrated Webcam: Integrated W").
+pub fn clean_name(name: &str) -> String {
+    if let Some((head, tail)) = name.split_once(": ")
+        && !tail.is_empty()
+        && head.starts_with(tail)
+    {
+        return head.to_string();
+    }
+    name.to_string()
+}
+
+/// Sorts devices by node number ("/dev/video2" before "/dev/video10") and
+/// drops duplicates.
+pub fn sort_devices(devices: &mut Vec<Device>) {
+    fn key(path: &str) -> (String, u64) {
+        let digits = path.len() - path.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+        let (stem, num) = path.split_at(path.len() - digits);
+        (stem.to_string(), num.parse().unwrap_or(0))
+    }
+    devices.sort_by_key(|d| key(&d.path));
+    devices.dedup_by(|a, b| a.path == b.path);
+}
+
+/// The real device node behind a path (`/dev/v4l/by-id/…` links point to
+/// `/dev/videoN`); the path itself if it cannot be resolved.
+pub fn resolve(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| path.to_string())
+}
+
+/// The device a `camera` setting names: "auto" is the first one, a path
+/// matches the device it is or links to.  `None` for "none", "test" and
+/// devices that are not listed.
+pub fn find<'a>(setting: &str, devices: &'a [Device]) -> Option<&'a Device> {
+    match setting {
+        "auto" => devices.first(),
+        "none" | "test" => None,
+        path => {
+            let real = resolve(path);
+            devices.iter().find(|d| d.path == path || d.path == real)
+        }
+    }
+}
+
+/// A path for `device` (e.g. "/dev/video2") that stays the same when the
+/// numbering changes: a link in `/dev/v4l/by-id` (or `by-path`) pointing at
+/// it, else the device itself.  `v4l_dir` is normally "/dev/v4l".
+pub fn stable_path(device: &str, v4l_dir: &std::path::Path) -> String {
+    let real = resolve(device);
+    for sub in ["by-id", "by-path"] {
+        let Ok(entries) = std::fs::read_dir(v4l_dir.join(sub)) else {
+            continue;
+        };
+        let mut links: Vec<String> = entries
+            .flatten()
+            .map(|e| e.path().display().to_string())
+            .filter(|p| resolve(p) == real)
+            .collect();
+        links.sort();
+        if let Some(l) = links.into_iter().next() {
+            return l;
+        }
+    }
+    device.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,6 +142,70 @@ mod tests {
             fps_n: fps,
             fps_d: 1,
         }
+    }
+
+    fn dev(path: &str) -> Device {
+        Device {
+            path: path.into(),
+            name: format!("cam {path}"),
+            modes: vec![m("YUY2", 640, 480, 30)],
+        }
+    }
+
+    #[test]
+    fn device_names_without_repetition() {
+        assert_eq!(
+            clean_name("Integrated Webcam: Integrated W"),
+            "Integrated Webcam"
+        );
+        assert_eq!(clean_name("HD Pro Webcam C920"), "HD Pro Webcam C920");
+        assert_eq!(clean_name("Cam: Other"), "Cam: Other");
+        assert_eq!(clean_name("Cam: "), "Cam: ");
+    }
+
+    #[test]
+    fn devices_sorted_by_number() {
+        let mut d = vec![
+            dev("/dev/video10"),
+            dev("/dev/video2"),
+            dev("/dev/video0"),
+            dev("/dev/video2"),
+        ];
+        sort_devices(&mut d);
+        let paths: Vec<&str> = d.iter().map(|d| d.path.as_str()).collect();
+        assert_eq!(paths, ["/dev/video0", "/dev/video2", "/dev/video10"]);
+    }
+
+    #[test]
+    fn settings_find_devices_also_through_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = dir.path().join("video4");
+        std::fs::write(&node, "").unwrap();
+        let by_id = dir.path().join("v4l/by-id");
+        std::fs::create_dir_all(&by_id).unwrap();
+        let link = by_id.join("usb-Cam_123-video-index0");
+        std::os::unix::fs::symlink(&node, &link).unwrap();
+        let node = resolve(&node.display().to_string());
+        let devices = vec![dev("/dev/video0"), dev(&node)];
+
+        assert_eq!(find("auto", &devices).unwrap().path, "/dev/video0");
+        assert_eq!(find("auto", &[]), None);
+        assert_eq!(find("none", &devices), None);
+        assert_eq!(find("test", &devices), None);
+        assert_eq!(find("/dev/video9", &devices), None);
+        assert_eq!(find(&node, &devices).unwrap().path, node);
+        let link = link.display().to_string();
+        assert_eq!(find(&link, &devices).unwrap().path, node);
+
+        assert_eq!(stable_path(&node, &dir.path().join("v4l")), link);
+        assert_eq!(
+            stable_path("/dev/video0", &dir.path().join("v4l")),
+            "/dev/video0"
+        );
+        assert_eq!(
+            stable_path("/dev/video0", &dir.path().join("missing")),
+            "/dev/video0"
+        );
     }
 
     #[test]

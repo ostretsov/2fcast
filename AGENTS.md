@@ -132,3 +132,9 @@ claim a container run proves anything about the user's real network.
 - The idle picture is scaled once (gdk-pixbuf) to its pad's exact size and
   fed through an `intervideosrc` without a fixed size, so the compositor
   never scales it again (sharpness).
+- `DeviceMonitor` also starts the PipeWire provider, whose first listing is
+  often empty: a camera picked then got no mode and ran at the driver's
+  default (raw full HD, 2-5 fps).  `video_devices` asks `v4l2deviceprovider`
+  directly; an unlisted device is probed with a `v4l2src` in READY.
+- Webcams with `exposure_dynamic_framerate` (C922) halve their frame rate in
+  dim light; the camera pipeline turns it off with `extra-controls`.

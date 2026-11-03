@@ -54,6 +54,9 @@ pub const MIC_PROCESS: &str = "mic_process";
 /// `identity` before the speakers playing the partner's voice: lowers it
 /// while I speak (only there; the recording takes the voice before it).
 pub const DUCK: &str = "duck";
+/// `identity` after the camera is scaled to [`cam_caps`]: the app smooths
+/// skin there ([`crate::skin`]), so preview, partner and recording all get it.
+pub const CAM_FILTER: &str = "cam_filter";
 
 /// Mixes interleaved stereo frames into mono with (left, right) weights.
 pub fn mix_to_mono(stereo: &[i16], gains: [f32; 2]) -> Vec<i16> {
@@ -190,6 +193,11 @@ pub enum CamSource {
 }
 
 /// Local camera: shown/recorded via `cam_local`, sent to the peer as H.264.
+/// Webcam controls set on start.  Some cameras (C922) may lower their frame
+/// rate in dim light to expose longer ("exposure, dynamic framerate"): down
+/// to ~15 fps, which looks choppy.  Cameras without the control ignore it.
+const CAMERA_CONTROLS: &str = "extra-controls=\"c,exposure_dynamic_framerate=0\"";
+
 pub fn camera(ch: &Channels, src: &CamSource) -> String {
     let source = match src {
         CamSource::Device {
@@ -197,13 +205,13 @@ pub fn camera(ch: &Channels, src: &CamSource) -> String {
             mode: Some(m),
         } => {
             format!(
-                "v4l2src device={path} do-timestamp=true ! {} ! {}",
+                "v4l2src device={path} do-timestamp=true {CAMERA_CONTROLS} ! {} ! {}",
                 m.caps(),
                 if m.is_jpeg() { "jpegdec !" } else { "" }
             )
         }
         CamSource::Device { path, mode: None } => {
-            format!("v4l2src device={path} do-timestamp=true ! decodebin !")
+            format!("v4l2src device={path} do-timestamp=true {CAMERA_CONTROLS} ! decodebin !")
         }
         CamSource::Test(rgb) => format!(
             "videotestsrc is-live=true pattern=ball background-color={:#010x} ! video/x-raw,width={CAM_W},height={CAM_H} !",
@@ -211,7 +219,7 @@ pub fn camera(ch: &Channels, src: &CamSource) -> String {
         ),
     };
     format!(
-        "{source} videoconvert ! videoscale add-borders=true ! videorate ! {caps} ! tee name=tcam \
+        "{source} videoconvert ! videoscale add-borders=true ! videorate ! {caps} ! identity name={CAM_FILTER} ! tee name=tcam \
          tcam. ! queue leaky=downstream max-size-buffers=2 ! intervideosink sync=false async=false channel={local} \
          tcam. ! {send}",
         caps = cam_caps(),
@@ -422,7 +430,7 @@ const FOREVER_NS: u64 = 100 * 365 * 24 * 3600 * 1_000_000_000;
 pub fn program(ch: &Channels) -> String {
     let mut s = format!(
         "compositor name=comp background=black ! {caps} ! cairooverlay name=overlay ! tee name=tprog \
-         tprog. ! queue leaky=downstream max-size-buffers=2 ! videoscale ! videoconvert ! \
+         tprog. ! queue leaky=downstream max-size-buffers=2 ! videoscale method=nearest-neighbour ! videoconvert ! \
          video/x-raw,format=BGRA,width={PREVIEW_W},height={PREVIEW_H} ! appsink name=preview drop=true max-buffers=1 sync=true qos=true async=false \
          tprog. ! queue leaky=downstream max-size-buffers=2 ! intervideosink sync=false async=false channel={program}",
         caps = program_caps(),
@@ -622,7 +630,9 @@ mod tests {
             },
         );
         assert!(s.contains("v4l2src device=/dev/video0"));
+        assert!(s.contains("extra-controls=\"c,exposure_dynamic_framerate=0\""));
         assert!(s.contains("image/jpeg,width=960") && s.contains("jpegdec"));
+        assert!(s.contains("I420,width=960,height=540,pixel-aspect-ratio=1/1,framerate=30/1 ! identity name=cam_filter ! tee name=tcam"));
         assert!(
             s.contains("channel=t1-cam_local")
                 && s.contains("name=valve_cam")

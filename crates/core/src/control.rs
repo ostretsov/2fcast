@@ -12,6 +12,11 @@
 //! {"cmd":"mute","on":true}
 //! {"cmd":"hide_self_view","on":true}  // my camera hidden on my screen only
 //! {"cmd":"idle_image","path":"/home/me/logo.png"}  // omit path: black again
+//! {"cmd":"cameras"}
+//! {"cmd":"camera","device":"/dev/video2"}  // or "auto", "none", "test"
+//! {"cmd":"smooth_skin","on":true}
+//! {"cmd":"smooth_skin","strength":0.8}   // 0..1; with or without "on"
+//! {"cmd":"warmth","value":0.5}           // 0 = off .. 1
 //! {"cmd":"preset","name":"cams_only"}
 //! {"cmd":"draw","points":[[0.1,0.1],[0.5,0.5]]}
 //! {"cmd":"text","x":0.1,"y":0.2,"text":"hello"}
@@ -52,6 +57,24 @@ pub enum Command {
     },
     Preset {
         name: String,
+    },
+    /// Webcams that can be picked.
+    Cameras,
+    /// Switches my camera (and saves the choice in `config.toml`): a device
+    /// from `cameras`, "auto" (the first one), "none" or "test".
+    Camera {
+        device: String,
+    },
+    /// Skin smoothing on my camera picture, and/or how strong (remembered).
+    SmoothSkin {
+        #[serde(default)]
+        on: Option<bool>,
+        #[serde(default)]
+        strength: Option<f64>,
+    },
+    /// Warm colour grade of my camera picture, 0 (off) .. 1 (remembered).
+    Warmth {
+        value: f64,
     },
     /// Picture shown in the shared space while nobody shares (remembered);
     /// without `path`, none (black).
@@ -105,6 +128,15 @@ pub struct WindowEntry {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct CameraEntry {
+    /// Device node, e.g. "/dev/video2".
+    pub device: String,
+    pub name: String,
+    /// This is the camera in use.
+    pub active: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct SharedWindow {
     pub xid: u32,
     /// Size before it was shrunk for sharing (restored afterwards).
@@ -135,6 +167,18 @@ pub struct State {
     #[serde(default)]
     pub disk_free_bytes: Option<u64>,
     pub muted: bool,
+    /// My camera in use: its device node, "test", or `None` (no camera).
+    #[serde(default)]
+    pub camera: Option<String>,
+    #[serde(default)]
+    pub smooth_skin: bool,
+    #[serde(default)]
+    pub smooth_skin_strength: f64,
+    #[serde(default)]
+    pub warmth: f64,
+    /// Average time smoothing and warmth take per camera frame (while on).
+    #[serde(default)]
+    pub camera_look_ms: Option<f64>,
     #[serde(default)]
     pub self_view_hidden: bool,
     /// Picture shown while nobody shares, and how sharp it looks.
@@ -166,6 +210,8 @@ pub struct Reply {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub windows: Vec<WindowEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cameras: Vec<CameraEntry>,
     pub state: State,
 }
 
@@ -255,6 +301,33 @@ mod tests {
                 shape: Some(Shape::Rect),
             })
         );
+        assert_eq!(parse(r#"{"cmd":"cameras"}"#), Ok(Command::Cameras));
+        assert_eq!(
+            parse(r#"{"cmd":"camera","device":"/dev/video2"}"#),
+            Ok(Command::Camera {
+                device: "/dev/video2".into()
+            })
+        );
+        assert!(parse(r#"{"cmd":"camera"}"#).is_err());
+        assert_eq!(
+            parse(r#"{"cmd":"smooth_skin","on":true}"#),
+            Ok(Command::SmoothSkin {
+                on: Some(true),
+                strength: None
+            })
+        );
+        assert_eq!(
+            parse(r#"{"cmd":"smooth_skin","strength":0.8}"#),
+            Ok(Command::SmoothSkin {
+                on: None,
+                strength: Some(0.8)
+            })
+        );
+        assert_eq!(
+            parse(r#"{"cmd":"warmth","value":0.5}"#),
+            Ok(Command::Warmth { value: 0.5 })
+        );
+        assert!(parse(r#"{"cmd":"warmth"}"#).is_err());
         assert_eq!(parse(r#"{"cmd":"undo"}"#), Ok(Command::Undo));
         assert_eq!(
             parse(r#"{"cmd":"ping","x":0.5,"y":0.25}"#),
@@ -288,5 +361,6 @@ mod tests {
         let back: Reply = serde_json::from_str(&line).unwrap();
         assert_eq!(back, r);
         assert!(!line.contains("\"windows\""), "empty window list omitted");
+        assert!(!line.contains("\"cameras\""), "empty camera list omitted");
     }
 }

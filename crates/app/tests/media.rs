@@ -57,6 +57,8 @@ fn machine_cfg(
         duck_db: None,
         playback: false,
         h264_decoder: DECODER.with(|d| d.get()),
+        smooth_skin_strength: 0.6,
+        warmth: 0.0,
     };
     adjust(&mut cfg);
     Media::new(cfg, errors).unwrap()
@@ -359,6 +361,24 @@ fn mute_and_peer_changes_are_safe_at_any_time() {
     a.stop_screen();
     assert!(a.stop_recording().is_none());
     assert!(a.has_camera());
+    // Switching the camera while connected: off, another one, back.
+    a.set_peer(Some((LOCALHOST, Ports::from_base(47440))));
+    a.set_camera(None).unwrap();
+    assert!(!a.has_camera() && a.camera_source().is_none());
+    a.set_camera(Some(CamSource::Test(0x0000ff))).unwrap();
+    assert_eq!(a.camera_source(), Some(&CamSource::Test(0x0000ff)));
+    a.set_camera(Some(CamSource::Test(A_COLOR))).unwrap();
+    assert!(a.has_camera());
+    a.set_smooth_skin(true);
+    assert!(a.smooth_skin());
+    a.set_smooth_skin_strength(3.0);
+    assert_eq!(a.smooth_skin_strength(), 1.0, "clamped");
+    a.set_warmth(0.4);
+    a.set_camera(Some(CamSource::Test(0x0000ff))).unwrap(); // look follows
+    assert_eq!(a.warmth(), 0.4);
+    a.set_smooth_skin(false);
+    a.set_warmth(0.0);
+    assert!(!a.smooth_skin() && a.camera_look_ms().is_none());
 }
 
 #[test]
