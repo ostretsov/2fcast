@@ -84,6 +84,9 @@ Be careful with the user's desktop and session:
   ones (plus `libgl1`/`libegl1`, which libepoxy loads with dlopen). When adding
   a GStreamer element, add its plugin to `PLUGINS` there and to
   `deps::ELEMENTS`.
+- Releasing: the `/release` skill (`.claude/skills/release/SKILL.md`) bumps
+  the version, commits, tags `vX.Y.Z` and pushes; the tag's CI run publishes
+  the `.deb`, which installed apps then offer as an update.
 - `make docker-test` installs the `.deb` in clean Ubuntu containers and runs
   `2fcast --self-test`. Run it after packaging changes.
 
