@@ -7,4 +7,5 @@ pub mod media;
 pub mod selftest;
 pub mod share_audio;
 pub mod ui;
+pub mod update;
 pub mod windows;

@@ -78,6 +78,7 @@ const CSS: &str = "
 .preview { background: #111; }
 .error-bar { color: #e01b24; padding: 2px 8px; }
 .recording-status { color: #e01b24; font-weight: bold; }
+.update-bar { padding: 4px 8px; background: alpha(@accent_bg_color, 0.15); }
 ";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -122,6 +123,8 @@ struct Ui {
     recording_status: gtk::Label,
     /// Color buttons, in [`PALETTE`] order.
     swatches: Vec<gtk::ToggleButton>,
+    /// "A new version is available" banner.
+    updater: crate::update::Updater,
 }
 
 pub struct App {
@@ -568,7 +571,17 @@ fn build(
         }
         glib::ControlFlow::Continue
     });
-    app.borrow().ui.window.present();
+    {
+        let a = app.clone();
+        let app = app.borrow();
+        app.ui
+            .updater
+            .set_recording_check(move || a.try_borrow().is_ok_and(|a| a.media.is_recording()));
+        if app.cfg.check_updates {
+            app.ui.updater.check(false);
+        }
+        app.ui.window.present();
+    }
     Ok(())
 }
 
@@ -766,6 +779,8 @@ fn build_widgets(gapp: &gtk::Application, cfg: &Config, cfg_dir: &std::path::Pat
         .margin_start(8)
         .build();
     warning.add_css_class("error-bar");
+    let updater = crate::update::Updater::new();
+    vbox.append(&updater.root);
     vbox.append(&tools);
     vbox.append(&warning);
     vbox.append(&overlay);
@@ -788,6 +803,7 @@ fn build_widgets(gapp: &gtk::Application, cfg: &Config, cfg_dir: &std::path::Pat
         meters,
         recording_status,
         swatches: vec![],
+        updater,
     }
 }
 
@@ -1823,6 +1839,10 @@ impl App {
                 self.apply(out);
                 Ok(())
             }
+            C::CheckUpdate => {
+                self.ui.updater.check(true);
+                Ok(())
+            }
         };
         let state = self.control_state();
         match result {
@@ -1885,6 +1905,7 @@ impl App {
             receiving_from_peer: self.receiving_from_peer(),
             peer_receives_us: self.session.peer_receives_us,
             warning: self.connection_warning(),
+            update: self.ui.updater.status(),
         }
     }
 

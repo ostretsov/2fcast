@@ -116,6 +116,14 @@ GStreamer (only the plugins 2fcast uses) and their libraries in
 names that change between Ubuntu releases. Tested on clean Ubuntu 22.04,
 24.04 and 26.10. Check an installation with `2fcast --self-test`.
 
+**Updates.** At start the installed app asks GitHub whether a newer release
+exists. If so, a bar above the shared space says "2fcast 0.8.0 is available"
+(with a link to what's new): click **Install** and it downloads the `.deb`,
+checks its SHA-256 against the one GitHub reports, and installs it with
+`apt` — Ubuntu asks for your password. Then click **Restart 2fcast** (not
+while recording). The × hides the bar until the next start; offline, nothing
+is shown. `check_updates = false` turns the check off.
+
 Build the package yourself (on the *oldest* Ubuntu it should run on):
 
 ```sh
@@ -169,6 +177,7 @@ instances on one machine — your webcam as "Artem", a test camera as
 | `camera_warmth` | `1.0` | warm colour grade of my camera, `0` (off) … `1` (the **Warmth** slider) |
 | `record_bitrate_kbps` | `6000` | video bitrate of the recording (~2.7 GB/hour max) |
 | `record_preset` | `"veryfast"` | x264 speed: `superfast` uses less CPU, `faster` gives better quality |
+| `check_updates` | `true` | at start, look for a newer release on GitHub and offer to install it |
 
 Button choices that should survive a restart (currently **Self-view**) are
 kept in `ui.json` next to it, so clicking buttons never touches your
@@ -207,6 +216,7 @@ S=/run/user/$UID/2fcast.sock
 2fcast --ctl $S '{"cmd":"ping","x":0.5,"y":0.5}'
 2fcast --ctl $S '{"cmd":"undo"}'
 2fcast --ctl $S '{"cmd":"clear"}'
+2fcast --ctl $S '{"cmd":"check_update"}'   # look for a newer release now; the state's "update" shows the bar
 ```
 
 The state includes, among others, `recording` / `peer_recording`,

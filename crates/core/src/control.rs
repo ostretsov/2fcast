@@ -25,6 +25,7 @@
 //! {"cmd":"ping","x":0.5,"y":0.5}
 //! {"cmd":"undo"}
 //! {"cmd":"clear"}
+//! {"cmd":"check_update"}   // look for a newer release now (also in dev builds)
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -109,6 +110,9 @@ pub enum Command {
     /// Removes my last drawing (like Ctrl+Z).
     Undo,
     Clear,
+    /// Looks for a newer 2fcast on GitHub now; if there is one the banner
+    /// offers it (see `State::update`).  Installing needs the user's click.
+    CheckUpdate,
 }
 
 pub fn parse_preset(name: &str) -> Option<Preset> {
@@ -201,6 +205,9 @@ pub struct State {
     pub peer_receives_us: Option<bool>,
     /// Connection warning shown in the window (empty if none).
     pub warning: String,
+    /// The "new version" banner's text (empty while hidden).
+    #[serde(default)]
+    pub update: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
@@ -251,6 +258,7 @@ mod tests {
     #[test]
     fn parses_commands() {
         assert_eq!(parse(r#"{"cmd":"state"}"#), Ok(Command::State));
+        assert_eq!(parse(r#"{"cmd":"check_update"}"#), Ok(Command::CheckUpdate));
         assert_eq!(
             parse(r#"{"cmd":"share"}"#),
             Ok(Command::Share { xid: None })

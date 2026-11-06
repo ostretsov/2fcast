@@ -18,7 +18,9 @@ gst_app = { version = "0.25.2", package = "gstreamer-app" }
 gst_video = { version = "0.25.4", package = "gstreamer-video" }
 gtk = { version = "0.11.5", package = "gtk4", features = ["v4_6"] }
 serde_json = "1.0.154"
+sha2 = "0.11.1"
 twofcast-core = { version = "0.7.0", path = "../core" }
+ureq = "3.5.1"
 x11rb = "0.14.0"
 
 [dev-dependencies]

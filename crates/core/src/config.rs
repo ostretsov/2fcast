@@ -50,6 +50,8 @@ pub struct Config {
     pub smooth_skin_strength: f64,
     /// Warm colour grade of my camera, 0 (off) .. 1 (Camera menu).
     pub camera_warmth: f64,
+    /// At start, look for a newer 2fcast on GitHub and offer to install it.
+    pub check_updates: bool,
 }
 
 impl Default for Config {
@@ -78,6 +80,7 @@ impl Default for Config {
             record_preset: "veryfast".into(),
             smooth_skin_strength: 1.0,
             camera_warmth: 1.0,
+            check_updates: true,
         }
     }
 }

@@ -19,6 +19,7 @@ pub mod protocol;
 pub mod pulse;
 pub mod session;
 pub mod skin;
+pub mod update;
 pub mod voice;
 
 /// Stable identifier of one installation (stored in the config file).
