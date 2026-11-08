@@ -596,7 +596,9 @@ pub struct Media {
     screen_ready: Arc<AtomicBool>,
     /// The pads last asked for, and whether they were applied with the
     /// partner's screen ready.
-    pads: Mutex<Option<(Pads, bool)>>,
+    pads: Mutex<Option<(Pads, bool, bool)>>,
+    /// Until when the idle picture stays hidden ([`Media::hold_idle`]).
+    idle_held_until: Option<Instant>,
     /// Picture shown in the shared space while nobody shares.
     idle: Option<Idle>,
 }
@@ -742,6 +744,7 @@ impl Media {
             screen_keyframes: Arc::default(),
             screen_ready: Arc::default(),
             pads: Mutex::new(None),
+            idle_held_until: None,
             idle: None,
         };
         // A missing/busy camera or microphone must not prevent talking.
@@ -1129,8 +1132,9 @@ impl Media {
     /// complete picture of it arrived (see [`Media::refresh_pads`]).
     pub fn apply_pads(&self, pads: &Pads) {
         let ready = self.screen_ready.load(Ordering::Relaxed);
-        *self.pads.lock().unwrap() = Some((*pads, ready));
-        let mut shown = pads.show_remote_screen(ready);
+        let held = self.idle_held();
+        *self.pads.lock().unwrap() = Some((*pads, ready, held));
+        let mut shown = pads.show_remote_screen(ready).hold_idle(held);
         match &self.idle {
             Some(idle) if shown.idle.alpha > 0.0 => {
                 idle.send((shown.idle.w.max(0) as u32, shown.idle.h.max(0) as u32));
@@ -1141,7 +1145,7 @@ impl Media {
     }
 
     fn reapply_pads(&self) {
-        let pads = self.pads.lock().unwrap().map(|(p, _)| p);
+        let pads = self.pads.lock().unwrap().map(|(p, _, _)| p);
         if let Some(p) = pads {
             self.apply_pads(&p);
         }
@@ -1191,6 +1195,17 @@ impl Media {
         Ok(Some(size))
     }
 
+    /// Keeps the idle picture hidden until `until` (the partner is about to
+    /// share again), then shows it if still nobody's picture is there.
+    /// Takes effect with the next [`Media::apply_pads`].
+    pub fn hold_idle(&mut self, until: Option<Instant>) {
+        self.idle_held_until = until;
+    }
+
+    fn idle_held(&self) -> bool {
+        self.idle_held_until.is_some_and(|t| Instant::now() < t)
+    }
+
     /// Size of the idle picture, if one is set.
     pub fn idle_image_size(&self) -> Option<(u32, u32)> {
         self.idle.as_ref().map(Idle::size)
@@ -1200,12 +1215,16 @@ impl Media {
     /// (or hides it again when it stopped).  Cheap: call it often.
     pub fn refresh_pads(&self) {
         let ready = self.screen_ready.load(Ordering::Relaxed);
-        let pads = match *self.pads.lock().unwrap() {
-            Some((pads, applied)) if applied != ready => pads,
+        let held = self.idle_held();
+        let (pads, was_ready, was_held) = match *self.pads.lock().unwrap() {
+            Some((pads, r, h)) if r != ready || h != held => (pads, r, h),
             _ => return,
         };
-        if ready {
+        if ready && !was_ready {
             debug("receive-screen: complete picture arrived, showing it");
+        }
+        if was_held && !held && !ready {
+            debug("the partner's share did not come back: idle picture");
         }
         self.apply_pads(&pads);
     }

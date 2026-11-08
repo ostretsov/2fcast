@@ -320,6 +320,15 @@ impl Pads {
         }
         self
     }
+
+    /// These pads without the idle picture if `hold` (the partner is about
+    /// to share again): the shared space stays as it is meanwhile.
+    pub fn hold_idle(mut self, hold: bool) -> Pads {
+        if hold {
+            self.idle.alpha = 0.0;
+        }
+        self
+    }
 }
 
 fn pad(t: Option<&Tile>, shown: bool, zorder: u32) -> PadParams {
@@ -520,6 +529,10 @@ mod tests {
         // My own share never waits.
         let mine = l.pads(&ids[0], Some(&ids[1]), Some(&ids[0]));
         assert_eq!(mine.show_remote_screen(false), mine);
+        // The partner is about to share again: no idle picture meanwhile.
+        let held = p.show_remote_screen(false).hold_idle(true);
+        assert_eq!((held.idle.alpha, held.screen_remote.alpha), (0.0, 0.0));
+        assert_eq!(p.hold_idle(false), p);
     }
 
     #[test]

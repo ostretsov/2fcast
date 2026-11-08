@@ -113,6 +113,10 @@ impl Out {
     }
 }
 
+/// How long to wait for the peer's share to come back after I stopped mine
+/// (it restarts its capture, then the first picture travels).
+pub const PEER_RESUME_WAIT: Duration = Duration::from_secs(3);
+
 pub struct Session {
     pub me: PeerId,
     pub my_name: String,
@@ -125,6 +129,12 @@ pub struct Session {
     /// The peer took the shared space over while I was sharing; when they
     /// stop, my share comes back.
     share_interrupted: bool,
+    /// I took the shared space over from the peer (their share comes back
+    /// when I stop).
+    took_over_from_peer: bool,
+    /// When I stopped a share that interrupted the peer's: until their share
+    /// arrives again, the idle picture stays hidden (no flash in between).
+    peer_resumes_since: Option<Instant>,
     /// When this machine started recording.
     pub recording_since: Option<Instant>,
     /// When the peer started recording (from its reported elapsed time).
@@ -145,6 +155,8 @@ impl Session {
             annotations: Annotations::default(),
             sharing: false,
             share_interrupted: false,
+            took_over_from_peer: false,
+            peer_resumes_since: None,
             recording_since: None,
             peer_recording_since: None,
             peer_receives_us: None,
@@ -192,6 +204,13 @@ impl Session {
         self.presenter().is_some() && self.presenter() == self.peer_id()
     }
 
+    /// Until when to keep the idle picture hidden because the peer is about
+    /// to share again (I stopped a share that had interrupted theirs).  The
+    /// wait is bounded: their window may be gone, then nothing comes.
+    pub fn hold_idle_until(&self) -> Option<Instant> {
+        self.peer_resumes_since.map(|t| t + PEER_RESUME_WAIT)
+    }
+
     pub fn display_name(&self, id: &PeerId) -> String {
         if *id == self.me {
             self.my_name.clone()
@@ -222,6 +241,7 @@ impl Session {
 
     pub fn connected(&mut self, peer: Peer) -> Out {
         self.peer = Some(peer);
+        self.peer_resumes_since = None;
         self.peer_receives_us = None;
         let ids = self.active_ids();
         let mut out = Out::default()
@@ -246,6 +266,7 @@ impl Session {
         let was_presenting = self.peer_is_presenting();
         self.peer = None;
         self.peer_receives_us = None;
+        self.peer_resumes_since = None;
         let mut out = Out::default().event(Event::PeerChanged);
         if was_presenting {
             out = out.event(Event::PresenterChanged);
@@ -261,6 +282,8 @@ impl Session {
     pub fn start_presenting(&mut self) -> Out {
         self.sharing = true;
         self.share_interrupted = false;
+        self.took_over_from_peer = self.peer_is_presenting();
+        self.peer_resumes_since = None;
         let stamp = self.presenter.set_local(Some(self.me.clone()), &self.me);
         self.annotations.clear();
         Out::default()
@@ -275,8 +298,12 @@ impl Session {
     pub fn stop_presenting(&mut self) -> Out {
         self.sharing = false;
         self.share_interrupted = false;
+        let took_over = std::mem::take(&mut self.took_over_from_peer);
         if self.presenter.value.as_ref() != Some(&self.me) {
             return Out::default();
+        }
+        if took_over && self.peer.is_some() {
+            self.peer_resumes_since = Some(Instant::now());
         }
         let stamp = self.presenter.set_local(None, &self.me);
         self.annotations.clear();
@@ -375,6 +402,10 @@ impl Session {
                 }
                 if self.presenter.value.as_ref() != Some(&self.me) {
                     self.sharing = false;
+                    self.took_over_from_peer = false;
+                }
+                if !self.peer_is_presenting() {
+                    self.peer_resumes_since = None;
                 }
                 if self.presenter.value != before {
                     self.annotations.clear();
@@ -571,9 +602,17 @@ mod tests {
         let o = p.b.start_presenting();
         let ev = p.a.handle(o.send[0].clone());
         assert!(!ev.has(Event::ResumeSharing));
+        assert!(p.b.hold_idle_until().is_none());
         let o = p.b.stop_presenting();
+        assert!(p.b.hold_idle_until().is_some(), "A's share is coming back");
         let ev = p.a.handle(o.send[0].clone());
         assert!(ev.has(Event::ResumeSharing));
+        let o = p.a.start_presenting();
+        p.deliver(o.send, vec![]);
+        assert!(p.b.hold_idle_until().is_some(), "until A's picture arrives");
+        let o = p.a.stop_presenting();
+        p.deliver(o.send, vec![]);
+        assert!(p.b.hold_idle_until().is_none(), "A stopped: idle again");
 
         // Only once: B shares and stops again, A was not sharing.
         let o = p.b.start_presenting();
@@ -589,6 +628,7 @@ mod tests {
         let o = p.b.start_presenting();
         p.a.handle(o.send[0].clone());
         let o = p.b.stop_presenting();
+        assert!(p.b.hold_idle_until().is_none(), "nothing to wait for");
         assert!(!p.a.handle(o.send[0].clone()).has(Event::ResumeSharing));
 
         // A shared, B took over, A then clicked "Stop sharing" (a no-op for
@@ -600,6 +640,60 @@ mod tests {
         p.a.stop_presenting();
         let o = p.b.stop_presenting();
         assert!(!p.a.handle(o.send[0].clone()).has(Event::ResumeSharing));
+    }
+
+    #[test]
+    fn idle_held_only_while_the_peers_share_can_come_back() {
+        let mut p = Pair::new();
+        let o = p.a.start_presenting();
+        p.deliver(o.send, vec![]);
+        let o = p.b.start_presenting();
+        p.deliver(vec![], o.send);
+        let before = Instant::now();
+        p.b.stop_presenting();
+        let until = p.b.hold_idle_until().unwrap();
+        assert!(until >= before + PEER_RESUME_WAIT);
+        assert!(until <= Instant::now() + PEER_RESUME_WAIT);
+        assert!(p.a.hold_idle_until().is_none(), "only the one who stopped");
+
+        // The peer leaves: nothing comes back.
+        p.b.disconnected();
+        assert!(p.b.hold_idle_until().is_none());
+
+        // I share again myself: my own share, nothing to wait for.
+        let mut p = Pair::new();
+        let o = p.a.start_presenting();
+        p.deliver(o.send, vec![]);
+        let o = p.b.start_presenting();
+        p.deliver(vec![], o.send);
+        p.b.stop_presenting();
+        p.b.start_presenting();
+        assert!(p.b.hold_idle_until().is_none());
+
+        // The peer took over from me in turn: my stop is a no-op, no wait.
+        let mut p = Pair::new();
+        let o = p.a.start_presenting();
+        p.deliver(o.send, vec![]);
+        let o = p.b.start_presenting();
+        p.deliver(vec![], o.send);
+        let o = p.a.start_presenting();
+        p.deliver(o.send, vec![]);
+        p.b.stop_presenting();
+        assert!(p.b.hold_idle_until().is_none());
+        // When A stops, A cannot know that B clicked stop meanwhile: it
+        // waits for B's share (bounded by PEER_RESUME_WAIT).
+        let o = p.a.stop_presenting();
+        assert!(p.a.hold_idle_until().is_some());
+        let ev = p.b.handle(o.send[0].clone());
+        assert!(!ev.has(Event::ResumeSharing), "B clicked stop meanwhile");
+    }
+
+    #[test]
+    fn alone_nothing_to_wait_for() {
+        let mut s = Session::new("a".into(), "A".into(), Layout::default());
+        s.start_presenting();
+        s.stop_presenting();
+        assert!(s.hold_idle_until().is_none());
     }
 
     #[test]

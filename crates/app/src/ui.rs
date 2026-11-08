@@ -1294,11 +1294,16 @@ impl App {
                 .as_ref()
                 .map(|p| (p.ip, Ports::from_base(p.base_port))),
         );
+        if out.has(Event::ResumeSharing) {
+            // Before the pads: the idle picture must not flash in between.
+            self.resume_sharing();
+        }
         if !self.session.is_presenting() && self.media.is_sharing() {
             self.end_local_share();
         }
         let s = &self.session;
         self.media.set_receive_screen(s.peer_is_presenting());
+        self.media.hold_idle(s.hold_idle_until());
         self.media
             .apply_pads(&s.layout().pads(&s.me, s.peer_id(), s.presenter()));
         self.media.set_overlay(&s.annotations, self.screen_rect());
@@ -1308,9 +1313,6 @@ impl App {
             eprintln!("[2fcast] saving layout: {e}");
         }
         self.refresh_ui();
-        if out.has(Event::ResumeSharing) {
-            self.resume_sharing();
-        }
         if out.has(Event::ScreenKeyframeRequested) {
             self.media.force_screen_keyframe();
         }

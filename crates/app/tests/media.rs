@@ -624,6 +624,72 @@ fn idle_picture_shows_while_nobody_shares() {
     });
 }
 
+/// Calls `refresh_pads` for `d` and asserts the idle picture never shows.
+fn never_idle(m: &Media, idle: u32, d: Duration, what: &str) {
+    let start = Instant::now();
+    while start.elapsed() < d {
+        m.refresh_pads();
+        if let Some(f) = m.latest_frame() {
+            let p = pixel(&f, 100.0, 200.0);
+            assert!(!near(p, idle), "idle picture shown {what}: {p:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn idle_picture_does_not_flash_when_the_partners_share_comes_back() {
+    const IDLE: u32 = 0xc03080;
+    let mut a = machine("back-a-", 47840, A_COLOR);
+    let mut b = machine("back-b-", 47860, B_COLOR);
+    a.set_peer(Some((LOCALHOST, Ports::from_base(47860))));
+    b.set_peer(Some((LOCALHOST, Ports::from_base(47840))));
+    let layout = Layout::preset(Preset::ScreenOnly, &ids());
+    let (me_a, me_b) = ("a".to_string(), "b".to_string());
+    let dir = tempfile::tempdir().unwrap();
+    a.set_idle_image(Some(&png(dir.path(), 1920, 1080, IDLE)))
+        .unwrap();
+
+    // A shares (having taken over from B), then stops: B's share comes back.
+    a.start_screen(&ScreenSource::Test, None).unwrap();
+    a.apply_pads(&layout.pads(&me_a, Some(&me_b), Some(&me_a)));
+    wait_for(&a, "own screen", smpte_visible);
+    a.stop_screen();
+    a.hold_idle(Some(Instant::now() + Duration::from_secs(10)));
+    a.apply_pads(&layout.pads(&me_a, Some(&me_b), None));
+    never_idle(
+        &a,
+        IDLE,
+        Duration::from_millis(1500),
+        "before B shares again",
+    );
+
+    // B shares again: no idle picture until its first complete picture.
+    b.start_screen(&ScreenSource::Test, None).unwrap();
+    a.apply_pads(&layout.pads(&me_a, Some(&me_b), Some(&me_b)));
+    a.set_receive_screen(true);
+    never_idle(
+        &a,
+        IDLE,
+        Duration::from_millis(500),
+        "while B's picture travels",
+    );
+    wait_for_shared(&b, &a, "partner's screen", smpte_visible);
+
+    // B's share does not come back: the idle picture once the wait is over.
+    b.stop_screen();
+    a.set_receive_screen(false);
+    a.hold_idle(Some(Instant::now() + Duration::from_secs(1)));
+    a.apply_pads(&layout.pads(&me_a, Some(&me_b), None));
+    never_idle(&a, IDLE, Duration::from_millis(700), "during the wait");
+    wait_frame(
+        &a,
+        "idle picture after the wait",
+        |f| near(pixel(f, 100.0, 200.0), IDLE),
+        || a.refresh_pads(),
+    );
+}
+
 #[test]
 fn partner_takes_over_sharing_while_we_record() {
     let mut a = machine_with("take-a-", 47600, A_COLOR, Some(MicSource::Test), true);
