@@ -418,6 +418,10 @@ pub const IDLE_INPUT: &str = "idle";
 /// How long an `intervideosrc` repeats the last picture: the idle picture
 /// is sent once and must never time out (to black).
 const FOREVER_NS: u64 = 100 * 365 * 24 * 3600 * 1_000_000_000;
+/// How long the partner's pictures repeat their last frame before turning
+/// black: they freeze (on purpose) from a lost packet to the next keyframe,
+/// which for the screen takes a request round trip, maybe two.
+const REMOTE_HOLD_NS: u64 = 3_000_000_000;
 
 /// Composes the final picture.  `overlay` (cairooverlay) draws annotations,
 /// `preview` (appsink) feeds the UI, the result goes to channel `program`.
@@ -442,8 +446,13 @@ pub fn program(ch: &Channels) -> String {
         } else {
             screen_caps()
         };
+        let timeout = if input.ends_with("_remote") {
+            REMOTE_HOLD_NS
+        } else {
+            1_000_000_000
+        };
         s += &format!(
-            " intervideosrc channel={} ! {caps} ! videoconvert ! video/x-raw,format=BGRx ! \
+            " intervideosrc channel={} timeout={timeout} ! {caps} ! videoconvert ! video/x-raw,format=BGRx ! \
              queue name=q_{input} max-size-buffers=2 leaky=downstream ! comp.",
             ch.get(input)
         );
@@ -690,6 +699,13 @@ mod tests {
         let idle = &s[s.find("channel=t1-idle").expect("idle input")..];
         let idle = &idle[..idle.find("comp.").unwrap()];
         assert!(idle.contains(&format!("timeout={FOREVER_NS}")), "{idle}");
+        assert!(
+            s.contains(&format!(
+                "channel={} timeout={REMOTE_HOLD_NS} ",
+                ch().get("screen_remote")
+            )),
+            "{s}"
+        );
         assert!(
             !idle.contains("width="),
             "no fixed size: no second scaling: {idle}"

@@ -312,6 +312,51 @@ fn watch_keyframes(
     }
 }
 
+/// Holds the last good picture of a receive pipeline after lost packets
+/// ([`keyframe::Freeze`]): frames are dropped before the decoder from the
+/// loss until the next keyframe, instead of being decoded into grey blocks
+/// and smeared text.
+pub fn freeze_on_loss(pipe: &gst::Pipeline, what: &'static str) {
+    let (Some(depay), Some(parse)) = (
+        pipe.by_name(pipelines::VIDEO_DEPAY)
+            .and_then(|e| e.static_pad("sink")),
+        pipe.by_name(pipelines::VIDEO_PARSE)
+            .and_then(|e| e.static_pad("src")),
+    ) else {
+        return;
+    };
+    let freeze = Arc::new(Mutex::new(keyframe::Freeze::default()));
+    let f = freeze.clone();
+    depay.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+        if let Some(gst::PadProbeData::Buffer(b)) = &info.data
+            && let Ok(map) = b.map_readable()
+            && map.len() >= 4
+            && f.lock()
+                .unwrap()
+                .packet(u16::from_be_bytes([map[2], map[3]]))
+        {
+            debug(&format!("{what}: packets lost, holding the last picture"));
+        }
+        gst::PadProbeReturn::Ok
+    });
+    parse.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+        let Some(gst::PadProbeData::Buffer(b)) = &info.data else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let keyframe = !b.flags().contains(gst::BufferFlags::DELTA_UNIT);
+        let mut f = freeze.lock().unwrap();
+        let was_frozen = f.frozen();
+        if f.pass(keyframe) {
+            if was_frozen {
+                debug(&format!("{what}: keyframe, picture moves again"));
+            }
+            gst::PadProbeReturn::Ok
+        } else {
+            gst::PadProbeReturn::Drop
+        }
+    });
+}
+
 /// Logs (debug) every 5 s how far the composed picture is behind the clock.
 fn log_lag(pad: &gst::Pad, pipeline: gst::Pipeline) {
     let seen = std::sync::atomic::AtomicU32::new(0);
@@ -967,6 +1012,7 @@ impl Media {
             match Pipe::launch("receive", &desc, &self.hooks).and_then(Pipe::play) {
                 Ok(p) => {
                     debug("receive: started");
+                    freeze_on_loss(p.get(), "receive");
                     if let Some(db) = self.cfg.duck_db
                         && let Some(pad) =
                             p.by_name(pipelines::DUCK).and_then(|e| e.static_pad("src"))
@@ -1086,6 +1132,7 @@ impl Media {
                         log_first_buffer(&pad, "receive-screen: first RTP packet");
                     }
                     watch_keyframes(&p, &self.screen_keyframes, &self.screen_ready);
+                    freeze_on_loss(p.get(), "receive-screen");
                     if let Some(pad) = p
                         .get()
                         .iterate_elements()

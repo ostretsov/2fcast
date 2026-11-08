@@ -49,6 +49,55 @@ impl Requests {
     }
 }
 
+/// Receiver side: holds the last good picture while packets are missing.
+///
+/// After a lost RTP packet the decoder would conceal the gap by smearing
+/// blocks of older pictures (grey blocks, ghost text) until the next
+/// keyframe.  Instead every frame from the loss on is dropped before the
+/// decoder, so the previous complete picture stays on screen until a
+/// keyframe arrives.  The stream starts frozen: frames before the first
+/// keyframe cannot be decoded cleanly either.
+#[derive(Debug)]
+pub struct Freeze {
+    next_seq: Option<u16>,
+    frozen: bool,
+}
+
+impl Default for Freeze {
+    fn default() -> Self {
+        Self {
+            next_seq: None,
+            frozen: true,
+        }
+    }
+}
+
+impl Freeze {
+    /// An RTP packet with sequence number `seq` arrived (in jitterbuffer
+    /// order).  Returns true when packets before it were lost and the
+    /// picture just froze.
+    pub fn packet(&mut self, seq: u16) -> bool {
+        let gap = self.next_seq.is_some_and(|n| n != seq);
+        self.next_seq = Some(seq.wrapping_add(1));
+        let froze = gap && !self.frozen;
+        self.frozen |= gap;
+        froze
+    }
+
+    /// A frame leaves the depayloader; returns whether to decode it.
+    /// A keyframe ends the freeze.
+    pub fn pass(&mut self, keyframe: bool) -> bool {
+        if keyframe {
+            self.frozen = false;
+        }
+        !self.frozen
+    }
+
+    pub fn frozen(&self) -> bool {
+        self.frozen
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,5 +125,40 @@ mod tests {
         r.want();
         assert!(!r.due(t0 + Duration::from_millis(10)));
         assert!(r.due(t0 + RETRY));
+    }
+
+    #[test]
+    fn frozen_until_the_first_keyframe() {
+        let mut f = Freeze::default();
+        assert!(!f.packet(7));
+        assert!(!f.pass(false), "a delta frame before any keyframe");
+        assert!(f.pass(true));
+        assert!(f.pass(false));
+    }
+
+    #[test]
+    fn a_lost_packet_holds_the_picture_until_the_next_keyframe() {
+        let mut f = Freeze::default();
+        f.packet(1);
+        assert!(f.pass(true));
+        assert!(!f.packet(2));
+        assert!(f.pass(false));
+        assert!(f.packet(4), "3 was lost");
+        assert!(!f.pass(false));
+        assert!(!f.packet(6), "already frozen");
+        f.packet(7);
+        assert!(!f.pass(false));
+        assert!(f.pass(true));
+        f.packet(8);
+        assert!(f.pass(false));
+    }
+
+    #[test]
+    fn sequence_numbers_wrap_around() {
+        let mut f = Freeze::default();
+        f.packet(u16::MAX);
+        f.pass(true);
+        assert!(!f.packet(0));
+        assert!(f.pass(false));
     }
 }
