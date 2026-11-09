@@ -1075,6 +1075,12 @@ impl Media {
         let desc = pipelines::screen(&self.cfg.channels, src, audio_source);
         let pipe = Pipe::launch("screen", &desc, &self.hooks)?;
         debug("screen: started");
+        if let ScreenSource::Window(xid) = src
+            && let Some(pad) = pipe.by_name("screensrc").and_then(|e| e.static_pad("src"))
+            && let Err(e) = crate::pointer::install(&pad, *xid)
+        {
+            crate::log::write(&format!("screen: no mouse pointer: {e:#}"));
+        }
         if let Some(pad) = pipe
             .by_name("net_screen")
             .and_then(|e| e.static_pad("sink"))

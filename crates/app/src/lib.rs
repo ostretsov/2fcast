@@ -4,6 +4,7 @@
 pub mod control;
 pub mod log;
 pub mod media;
+pub mod pointer;
 pub mod selftest;
 pub mod share_audio;
 pub mod ui;

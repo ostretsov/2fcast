@@ -5,6 +5,7 @@ pub mod annotations;
 pub mod camera;
 pub mod config;
 pub mod control;
+pub mod cursor;
 pub mod deps;
 pub mod gate;
 pub mod health;

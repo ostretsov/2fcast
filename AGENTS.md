@@ -139,5 +139,10 @@ claim a container run proves anything about the user's real network.
   often empty: a camera picked then got no mode and ran at the driver's
   default (raw full HD, 2-5 fps).  `video_devices` asks `v4l2deviceprovider`
   directly; an unlisted device is probed with a `v4l2src` in READY.
+- `ximagesrc xid=…` (1.20) reads the window position once and draws the
+  pointer into reused buffers; its `XShmGetImage` fails for a window partly
+  off-screen (GDK ignores the X error), so dragged windows left pointer
+  trails.  Window shares use `show-pointer=false` and `pointer.rs` draws it
+  (`tests/pointer.rs`, on Xvfb).
 - Webcams with `exposure_dynamic_framerate` (C922) halve their frame rate in
   dim light; the camera pipeline turns it off with `extra-controls`.

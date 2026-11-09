@@ -278,8 +278,9 @@ pub enum ScreenSource {
 /// captured from the PulseAudio source `audio_source`.
 pub fn screen(ch: &Channels, src: &ScreenSource, audio_source: Option<&str>) -> String {
     let source = match src {
+        // The pointer is drawn by the app (see `crate::cursor`).
         ScreenSource::Window(xid) => {
-            format!("ximagesrc xid={xid} use-damage=false show-pointer=true")
+            format!("ximagesrc name=screensrc xid={xid} use-damage=false show-pointer=false")
         }
         ScreenSource::Screen => "ximagesrc use-damage=false show-pointer=true".to_string(),
         ScreenSource::Test => "videotestsrc is-live=true pattern=smpte".to_string(),
@@ -653,7 +654,9 @@ mod tests {
     #[test]
     fn screen_with_and_without_audio() {
         let s = screen(&ch(), &ScreenSource::Window(0x3a00007), None);
-        assert!(s.contains("ximagesrc xid=60817415"));
+        assert!(s.contains("xid=60817415"));
+        // The app draws the pointer itself (`crate::cursor`).
+        assert!(s.contains("name=screensrc") && s.contains("show-pointer=false"));
         assert!(!s.contains("share_local"));
         let s = screen(&ch(), &ScreenSource::Screen, Some("twofcast_share.monitor"));
         assert!(

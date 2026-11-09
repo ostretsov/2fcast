@@ -21,7 +21,7 @@ serde_json = "1.0.154"
 sha2 = "0.11.1"
 twofcast-core = { version = "0.8.1", path = "../core" }
 ureq = "3.5.1"
-x11rb = "0.14.0"
+x11rb = { version = "0.14.0", features = ["xfixes"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
