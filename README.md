@@ -53,9 +53,8 @@ video podcast on Ubuntu:
   travels as a 1920×1080 frame).
 * **Draw, point and write** over the shared space — both of you, in four
   colors (the one who joined first draws red, the second green, until you pick
-  another): **Ping** (**Ctrl+P**, the default tool; click and ripples spread
-  from that spot for a moment — "look here"; a **right click** pings with any
-  tool), **Pen** (free hand), **Arrow** (**Ctrl+A**; drag from tail to tip),
+  another): **Ping** (**right click**, whatever the tool; ripples spread
+  from that spot for a moment — "look here"), **Pen** (free hand, the default), **Arrow** (**Ctrl+A**; drag from tail to tip),
   **Line** (**Ctrl+L**), **Rectangle** (**Ctrl+R**; drag corner to corner) —
   the mouse wheel makes these thinner or thicker, also while drawing — and
   **Text** (**Ctrl+T**; monospace code font, several lines, Tab indents). Text

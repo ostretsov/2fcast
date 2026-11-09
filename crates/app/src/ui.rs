@@ -83,7 +83,6 @@ const CSS: &str = "
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tool {
-    Ping,
     Pen,
     Arrow,
     Line,
@@ -99,7 +98,7 @@ impl Tool {
             Tool::Arrow => Some(Shape::Arrow),
             Tool::Line => Some(Shape::Line),
             Tool::Rect => Some(Shape::Rect),
-            Tool::Ping | Tool::Pen | Tool::Text | Tool::Arrange => None,
+            Tool::Pen | Tool::Text | Tool::Arrange => None,
         }
     }
 }
@@ -498,7 +497,7 @@ fn build(
         share_audio: None,
         shared_window: None,
         ids: IdGen::new(),
-        tool: Tool::Ping,
+        tool: Tool::Pen,
         color: PALETTE[0],
         stroke: None,
         arrow: None,
@@ -846,12 +845,11 @@ fn connect_signals(app: &Shared) {
     let mut keyed: Vec<(&str, gtk::ToggleButton)> = Vec::new();
     for (tool, label, tip, key) in [
         (
-            Tool::Ping,
-            "◎ Ping",
-            "Click to show the partner where to look (Ctrl+P); right click pings with any tool",
-            Some("<Control>p"),
+            Tool::Pen,
+            "✎ Pen",
+            "Draw over the shared space; right click (with any tool) shows the partner where to look",
+            None,
         ),
-        (Tool::Pen, "✎ Pen", "Draw over the shared space", None),
         (
             Tool::Arrow,
             "➜ Arrow",
@@ -967,7 +965,7 @@ fn connect_signals(app: &Shared) {
             })),
         ));
     }
-    // Ctrl+P / A / L / R / T: tools.  A focused text field gets the key first
+    // Ctrl+A / L / R / T: tools.  A focused text field gets the key first
     // (Ctrl+A there selects all).
     for (key, b) in keyed {
         shortcuts.add_shortcut(gtk::Shortcut::new(
@@ -2011,7 +2009,7 @@ impl App {
                     .hit(cx, cy, &self.session.active_ids())
                     .and_then(|id| l.tile(&id).map(|t| (id, t.rect)));
             }
-            Tool::Ping | Tool::Text => {}
+            Tool::Text => {}
         }
     }
 
@@ -2059,10 +2057,8 @@ impl App {
         let Some(at) = self.screen_point(x, y) else {
             return;
         };
-        match self.tool {
-            Tool::Ping => return self.ping(at),
-            Tool::Text => {}
-            _ => return,
+        if self.tool != Tool::Text {
+            return;
         }
         self.text_at = Some(at);
         self.typing = None;
